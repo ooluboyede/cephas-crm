@@ -1,0 +1,38 @@
+name: Foundation Documentation
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  validate-foundation:
+    name: Validate foundation artefacts
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate required documents
+        shell: bash
+        run: |
+          set -euo pipefail
+          required_files=(
+            "README.md"
+            "docs/PRODUCT_REQUIREMENTS.md"
+            "docs/architecture/REFERENCE_ARCHITECTURE.md"
+            "docs/security/SECURITY_BASELINE.md"
+            "docs/licensing/OFFLINE_LICENSING.md"
+            "docs/engineering/GATE_0_1_ACCEPTANCE.md"
+          )
+          for file in "${required_files[@]}"; do
+            test -s "$file" || { echo "Missing or empty required file: $file"; exit 1; }
+          done
+          echo "All required foundation documents exist and are non-empty."
+
+      - name: Check whitespace errors
+        run: git diff --check
