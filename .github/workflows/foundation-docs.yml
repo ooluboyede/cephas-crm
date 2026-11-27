@@ -75,6 +75,7 @@ jobs:
             "docs/security/GATE_0_1_12_1_ACTOR_BOUNDARY.md"
             "docs/security/GATE_0_1_13_INDEPENDENT_AUTHORITY_AUDIT.md"
             "docs/security/GATE_0_1_13_1_SIGNED_RECEIPTS_FENCING.md"
+            "docs/security/GATE_0_1_13_2_PERSISTENT_RECEIPT_FLOOR.md"
           )
           for file in "${required_files[@]}"; do
             git ls-files --error-unmatch -- "$file" >/dev/null
@@ -117,7 +118,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Compile proof harness
-        run: python3 -m py_compile proof/tenant_boundary/run.py proof/tenant_boundary/broker.py proof/tenant_boundary/recovery_state.py proof/tenant_boundary/actor_broker.py proof/tenant_boundary/independent_authority.py proof/tenant_boundary/authority_receipt.py
+        run: python3 -m py_compile proof/tenant_boundary/run.py proof/tenant_boundary/broker.py proof/tenant_boundary/recovery_state.py proof/tenant_boundary/actor_broker.py proof/tenant_boundary/independent_authority.py proof/tenant_boundary/authority_receipt.py proof/tenant_boundary/receipt_floor.py
       - name: Run real PostgreSQL proof
         env:
           PROOF_PR_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}

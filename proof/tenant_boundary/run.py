@@ -428,6 +428,97 @@ class Boundary(unittest.TestCase):
         other.activate(epoch)
         self.assertEqual(other.guard().phase,"active")
 
+    def r2_resume(self,r):
+        authority=Session("postgres",AUTHORITY_NAME,AUTHORITY_PASSWORD)
+        self.sessions.append(authority)
+        return R2Proof.resume(self.admin,authority,r.local,r.deployment,r.public,r.signer)
+
+    def test_f02_receipt_floor_survives_reconstruction_and_old_head_replay(self):
+        r=self.r2_fixture()
+        r.mutate("event1")
+        restarted=self.r2_resume(r)
+        self.assertEqual(restarted.guard().audit_sequence,1)
+        self.assertEqual(restarted.witness.read()[0],2)
+        r.authority.query("DELETE FROM anchor.receipt WHERE revision=2")
+        r.authority.query("UPDATE anchor.head SET audit_seq=0,digest=repeat('0',64)")
+        self.admin.query("TRUNCATE r2.effect,r2.outbox")
+        with self.assertRaises(AuthorityDenied):
+            self.r2_resume(r)
+        with self.assertRaises(AuthorityDenied):
+            restarted.guard()
+
+    def test_f02_missing_or_corrupted_witness_denies_restart(self):
+        r=self.r2_fixture()
+        r.witness.path.unlink()
+        with self.assertRaises(AuthorityDenied):
+            self.r2_resume(r)
+        r.witness.path.write_bytes(b"not sqlite")
+        with self.assertRaises(AuthorityDenied):
+            self.r2_resume(r)
+
+    def test_f02_witness_first_interrupted_authority_commit_blocks_restart(self):
+        r=self.r2_fixture()
+        class Interrupted:
+            def query(self,sql):
+                if sql=="COMMIT":
+                    r_original.query("ROLLBACK")
+                    raise RuntimeError("simulated interrupted commit")
+                return r_original.query(sql)
+        r_original=r.authority
+        r.authority=Interrupted()
+        with self.assertRaises(AuthorityDenied):
+            r.quarantine()
+        r.authority=r_original
+        self.assertEqual(r.witness.read()[0],2)
+        self.assertEqual(r.authority.query("SELECT max(revision) FROM anchor.receipt"),["1"])
+        with self.assertRaises(AuthorityDenied):
+            self.r2_resume(r)
+        with self.assertRaises(AuthorityDenied):
+            r.guard()
+
+    def test_f02_interrupted_epoch_reconciliation_can_resume_under_quarantine(self):
+        r=self.r2_fixture()
+        epoch=r.quarantine()
+        # Simulate committed primary epoch update before local journal advance.
+        self.admin.query("BEGIN")
+        self.admin.query(f"UPDATE r2.epoch SET value='{epoch}'")
+        self.admin.query(f"UPDATE auth.epoch SET value='{epoch}'")
+        self.admin.query("COMMIT")
+        restarted=self.r2_resume(r)
+        with self.assertRaises(AuthorityDenied):
+            restarted.guard()
+        restarted.reconcile_epoch()
+        restarted.activate(epoch)
+        self.assertEqual(restarted.guard().epoch,epoch)
+
+    def test_f02_actor_read_requires_live_fence_and_matching_epoch(self):
+        r=self.r2_fixture()
+        tokens={a:secrets.token_hex(32) for a in ("alice","charlie","bob")}
+        def read():
+            return r.fenced_read(tokens,Session,tokens["alice"],"A","1","list_items")
+        self.assertEqual(read(),["A1"])
+        epoch=r.quarantine()
+        with self.assertRaises(AuthorityDenied):
+            read()
+        r.reconcile_epoch()
+        r.activate(epoch)
+        self.assertEqual(read(),["A1"])
+        self.admin.query("UPDATE auth.epoch SET value=gen_random_uuid()")
+        with self.assertRaises(AuthorityDenied):
+            read()
+
+    def test_f02_witness_identity_and_compare_append_are_pinned(self):
+        from receipt_floor import ReceiptFloor
+        r=self.r2_fixture()
+        floor=r.witness.read()
+        wrong=ReceiptFloor(r.witness.path,str(uuid.uuid4()),r.public)
+        with self.assertRaises(ValueError):
+            wrong.read()
+        r.mutate("event1")
+        with self.assertRaises(ValueError):
+            r.witness.append(floor,[(2,"a"*64)])
+        self.assertEqual(r.witness.read()[0],2)
+
     def recovery_fixture(self):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
@@ -1032,7 +1123,7 @@ def main():
         print("Server:", with_version.stdout.strip(), "merge SHA:", os.environ.get("GITHUB_SHA", "local"),
               "PR head:", os.environ.get("PROOF_PR_HEAD", "local"), flush=True)
         result = unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromTestCase(Boundary))
-        if not result.wasSuccessful() or result.skipped or result.testsRun != 60:
+        if not result.wasSuccessful() or result.skipped or result.testsRun != 66:
             raise SystemExit(1)
     finally:
         for container in (NAME, AUTHORITY_NAME):
