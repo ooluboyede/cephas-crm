@@ -34,3 +34,5 @@ Gate 0.1.13 adds a second isolated disposable cluster and six R2 tests (55 Postg
 Gate 0.1.13.1 adds signed receipt verification, live floor, cooperative authority lock and five tests (60 PostgreSQL expected). See docs/security/GATE_0_1_13_1_SIGNED_RECEIPTS_FENCING.md for limitations.
 
 Gate 0.1.13.2 adds a separately retained persistent receipt witness, explicit resume and cooperative actor read fencing (66 PostgreSQL tests expected). See docs/security/GATE_0_1_13_2_PERSISTENT_RECEIPT_FLOOR.md for limitations; no production authority custody claimed.
+
+Gate 0.1.13.3 retains signed receipts in witness CAS and adds explicit one-step quarantine recovery plus a standalone rotation certificate verifier (70 PostgreSQL tests expected). See docs/security/GATE_0_1_13_3_DURABLE_RECEIPT_RECOVERY.md. No production rotation or independent custody.

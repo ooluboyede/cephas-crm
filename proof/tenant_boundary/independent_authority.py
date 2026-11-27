@@ -134,7 +134,7 @@ class R2Proof:
                 demand(digest == floor[1])
                 floor_seen = True
             if payload["revision"] > floor[0]:
-                entries.append((payload["revision"],digest))
+                entries.append((payload["revision"],digest,bytes.fromhex(body),bytes.fromhex(sig)))
             prior, previous = payload, digest
         demand(floor_seen)
         return prior, previous, floor, entries
@@ -149,7 +149,7 @@ class R2Proof:
         signature=self.signer.sign(raw)
         _, digest=verify(self.public,raw,signature,self.deployment)
         self.authority.query(f"INSERT INTO anchor.receipt VALUES({payload['revision']},'{raw.hex()}','{signature.hex()}')")
-        return payload["revision"],digest
+        return payload["revision"],digest,raw,signature
 
     def external(self, lock=False):
         try:
@@ -229,6 +229,65 @@ class R2Proof:
             except Exception:
                 pass
             raise AuthorityDenied("protected operation denied") from None
+
+    def recover_quarantine_receipt(self, expected_digest):
+        """Explicit trusted operator repair of one lost quarantine commit only.
+
+        No signing, new floor, primary mutation, activation or tail adoption.
+        """
+        try:
+            demand(type(expected_digest) is str and re.fullmatch(r"[0-9a-f]{64}",expected_digest))
+            self.authority.query("BEGIN")
+            self.authority.query("SET LOCAL lock_timeout='5s'")
+            rows=self.authority.query("SELECT seq,epoch,phase,audit_seq,digest FROM anchor.head WHERE singleton FOR UPDATE")
+            retained=self.witness.retained()
+            demand(len(rows)==1 and len(retained)>=2 and retained[-1][1]==expected_digest)
+            prior=None
+            previous=ZERO
+            seen=set()
+            for revision,digest,raw,sig in retained:
+                payload,verified=verify(self.public,raw,sig,self.deployment)
+                demand(verified==digest and payload["revision"]==revision)
+                transition(prior,payload,previous)
+                if prior is None or payload["epoch"]!=prior["epoch"]:
+                    demand(payload["epoch"] not in seen)
+                    seen.add(payload["epoch"])
+                prior,previous=payload,digest
+            n,digest,raw,sig=retained[-1]
+            target=prior
+            old,_=verify(self.public,retained[-2][2],retained[-2][3],self.deployment)
+            demand(old["phase"]=="active" and target["phase"]=="quarantine")
+            demand(rows==["|".join(str(old[k]) for k in ("sequence","epoch","phase","audit_sequence","digest"))])
+            expected_prefix=[f"{rev}|{body.hex()}|{signature.hex()}" for rev,_,body,signature in retained[:-1]]
+            demand(self.authority.query("SELECT revision,payload,signature FROM anchor.receipt ORDER BY revision LIMIT 4097")==expected_prefix)
+            expected_history=[]
+            last_epoch=None
+            for _,_,body,_ in retained[:-1]:
+                item=json.loads(body)
+                if item["epoch"]!=last_epoch:
+                    expected_history.append(f"{item['sequence']}|{item['epoch']}")
+                    last_epoch=item["epoch"]
+            demand(self.authority.query("SELECT seq,epoch FROM anchor.history ORDER BY seq")==expected_history)
+            demand(self.local_head()==(old["audit_sequence"],old["digest"]))
+            demand(read_state(self.local)==RecoveryState(old["sequence"],old["epoch"]))
+            for table in ("r2.epoch","auth.epoch"):
+                demand(self.primary.query(f"SELECT value FROM {table}")==[old["epoch"]])
+            demand(self.witness.read()==(n,digest))
+            epoch=target["epoch"]
+            seq=target["sequence"]
+            self.authority.query(f"INSERT INTO anchor.history VALUES('{epoch}',{seq})")
+            self.authority.query(f"INSERT INTO anchor.receipt VALUES({n},'{raw.hex()}','{sig.hex()}')")
+            self.authority.query(f"UPDATE anchor.head SET seq={seq},epoch='{epoch}',phase='quarantine' WHERE singleton")
+            head=self.external(lock=True)
+            demand(head.phase=="quarantine" and head.epoch==epoch)
+            self.authority.query("COMMIT")
+            return head
+        except Exception:
+            try:
+                self.authority.query("ROLLBACK")
+            except Exception:
+                pass
+            raise AuthorityDenied("recovery denied") from None
 
     def fenced_read(self, credentials, factory, token, tenant, bu, operation):
         # Trusted broker composition. No caller SQL or callback at public edge.

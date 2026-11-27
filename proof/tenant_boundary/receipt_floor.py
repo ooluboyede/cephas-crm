@@ -10,6 +10,7 @@ import sqlite3
 import uuid
 from contextlib import closing
 from pathlib import Path
+from authority_receipt import verify
 
 
 def require(ok):
@@ -22,6 +23,7 @@ class ReceiptFloor:
         self.path=Path(path)
         require(str(uuid.UUID(deployment))==deployment)
         require(type(public) is bytes and len(public)==44)
+        self.public=public
         self.deployment=deployment
         self.fingerprint=hashlib.sha256(public).hexdigest()
 
@@ -38,8 +40,16 @@ class ReceiptFloor:
         return sqlite3.connect(self.path.resolve(strict=True).as_uri()+"?mode="+mode,
                                uri=True,timeout=3,isolation_level=None)
 
+    def _entry(self,entry):
+        require(type(entry) is tuple and len(entry)==4)
+        n,d,raw,sig=entry
+        self.validate((n,d))
+        payload,digest=verify(self.public,raw,sig,self.deployment)
+        require(payload['revision']==n and digest==d)
+        return entry
+
     def initialize(self,genesis):
-        self.validate(genesis)
+        self._entry(genesis)
         require(genesis[0]==1)
         fd=os.open(self.path,os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o600)
         os.close(fd)
@@ -48,8 +58,8 @@ class ReceiptFloor:
             db.execute("BEGIN IMMEDIATE")
             db.execute("CREATE TABLE identity(singleton INTEGER PRIMARY KEY CHECK(singleton=1),deployment TEXT NOT NULL,fingerprint TEXT NOT NULL) STRICT")
             db.execute("INSERT INTO identity VALUES(1,?,?)",(self.deployment,self.fingerprint))
-            db.execute("CREATE TABLE floor(revision INTEGER PRIMARY KEY CHECK(revision>0),digest TEXT NOT NULL) STRICT")
-            db.execute("INSERT INTO floor VALUES(?,?)",genesis)
+            db.execute("CREATE TABLE floor(revision INTEGER PRIMARY KEY CHECK(revision>0),digest TEXT NOT NULL,payload BLOB NOT NULL,signature BLOB NOT NULL) STRICT")
+            db.execute("INSERT INTO floor VALUES(?,?,?,?)",genesis)
             db.commit()
         fd=os.open(self.path.parent,os.O_RDONLY|os.O_DIRECTORY)
         try:
@@ -70,6 +80,16 @@ class ReceiptFloor:
             db.execute("BEGIN")
             return self._head(db)
 
+    def retained(self):
+        with closing(self.connect("ro")) as db:
+            db.execute("PRAGMA query_only=ON")
+            db.execute("BEGIN")
+            head=self._head(db)
+            require(head[0]<=4096)
+            rows=db.execute("SELECT revision,digest,payload,signature FROM floor ORDER BY revision").fetchall()
+            require(len(rows)==head[0])
+            return rows
+
     def append(self,expected,entries):
         # Only verified contiguous receipts from trusted coordinator.
         # CAS across independent connections; no reset or blind adoption.
@@ -80,9 +100,11 @@ class ReceiptFloor:
             require(self._head(db)==expected)
             prior=expected
             for entry in entries:
-                self.validate(entry)
+                self._entry(entry)
                 require(entry[0]==prior[0]+1)
-                db.execute("INSERT INTO floor VALUES(?,?)",entry)
-                prior=entry
+                payload,_=verify(self.public,entry[2],entry[3],self.deployment)
+                require(payload["previous"]==prior[1])
+                db.execute("INSERT INTO floor VALUES(?,?,?,?)",entry)
+                prior=entry[:2]
             db.commit()
         return prior

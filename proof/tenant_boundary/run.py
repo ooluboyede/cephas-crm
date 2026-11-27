@@ -519,6 +519,97 @@ class Boundary(unittest.TestCase):
             r.witness.append(floor,[(2,"a"*64)])
         self.assertEqual(r.witness.read()[0],2)
 
+    def test_f02_retained_quarantine_commit_repaired_without_floor_reset(self):
+        r=self.r2_fixture()
+        original=r.authority
+        class Interrupted:
+            def query(self,sql):
+                if sql=="COMMIT":
+                    original.query("ROLLBACK")
+                    raise RuntimeError("simulated interrupted commit")
+                return original.query(sql)
+        r.authority=Interrupted()
+        with self.assertRaises(AuthorityDenied):
+            r.quarantine()
+        r.authority=original
+        retained=r.witness.read()
+        with self.assertRaises(AuthorityDenied):
+            r.recover_quarantine_receipt("a"*64)
+        head=r.recover_quarantine_receipt(retained[1])
+        self.assertEqual(head.phase,"quarantine")
+        self.assertEqual(r.witness.read(),retained)
+        with self.assertRaises(AuthorityDenied):
+            r.guard()
+        restarted=self.r2_resume(r)
+        restarted.reconcile_epoch()
+        restarted.activate(head.epoch)
+        self.assertEqual(restarted.guard().sequence,2)
+
+    def test_f02_retained_receipt_tamper_blocks_repair(self):
+        r=self.r2_fixture()
+        original=r.authority
+        class Interrupted:
+            def query(self,sql):
+                if sql=="COMMIT":
+                    original.query("ROLLBACK")
+                    raise RuntimeError("interrupted")
+                return original.query(sql)
+        r.authority=Interrupted()
+        with self.assertRaises(AuthorityDenied):
+            r.quarantine()
+        r.authority=original
+        expected=r.witness.read()
+        db=sqlite3.connect(r.witness.path)
+        try:
+            db.execute("UPDATE floor SET signature=zeroblob(64) WHERE revision=2")
+            db.commit()
+        finally:
+            db.close()
+        with self.assertRaises(AuthorityDenied):
+            r.recover_quarantine_receipt(expected[1])
+
+    def test_f02_unanchored_mutation_cannot_be_repaired_as_quarantine(self):
+        r=self.r2_fixture()
+        original=r.authority
+        class Interrupted:
+            def query(self,sql):
+                if sql=="COMMIT":
+                    original.query("ROLLBACK")
+                    raise RuntimeError("interrupted")
+                return original.query(sql)
+        r.authority=Interrupted()
+        with self.assertRaises(AuthorityDenied):
+            r.mutate("event1")
+        r.authority=original
+        with self.assertRaises(AuthorityDenied):
+            r.recover_quarantine_receipt(r.witness.read()[1])
+        with self.assertRaises(AuthorityDenied):
+            r.guard()
+
+    def test_f03_rotation_certificate_requires_both_keys_and_current_floor(self):
+        import hashlib
+        from authority_receipt import TestSigner, canonical, verify_rotation, ROTATION_DOMAIN
+        r=self.r2_fixture()
+        with tempfile.TemporaryDirectory() as d:
+            replacement=TestSigner(Path(d))
+            floor=r.witness.read()
+            raw=canonical({"version":1,"deployment":r.deployment,"generation":2,
+                "revision":floor[0],"receipt_digest":floor[1],
+                "old_fingerprint":hashlib.sha256(r.public).hexdigest(),
+                "new_fingerprint":hashlib.sha256(replacement.public).hexdigest()})
+            old=r.signer.sign(raw,ROTATION_DOMAIN)
+            new=replacement.sign(raw,ROTATION_DOMAIN)
+            self.assertEqual(verify_rotation(raw,old,new,r.public,replacement.public,r.deployment,1,floor),2)
+            for args in ((old,b"0"*64,r.public,replacement.public,r.deployment,1,floor),
+                         (old,new,r.public,replacement.public,r.deployment,2,floor),
+                         (old,new,r.public,replacement.public,r.deployment,1,(2,"a"*64)),
+                         (old,new,r.public,replacement.public,str(uuid.uuid4()),1,floor)):
+                with self.assertRaises(Exception):
+                    verify_rotation(raw,*args)
+            # Ordinary receipt signatures cannot authorize rotation.
+            with self.assertRaises(Exception):
+                verify_rotation(raw,r.signer.sign(raw),new,r.public,replacement.public,r.deployment,1,floor)
+
     def recovery_fixture(self):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
@@ -1123,7 +1214,7 @@ def main():
         print("Server:", with_version.stdout.strip(), "merge SHA:", os.environ.get("GITHUB_SHA", "local"),
               "PR head:", os.environ.get("PROOF_PR_HEAD", "local"), flush=True)
         result = unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromTestCase(Boundary))
-        if not result.wasSuccessful() or result.skipped or result.testsRun != 66:
+        if not result.wasSuccessful() or result.skipped or result.testsRun != 70:
             raise SystemExit(1)
     finally:
         for container in (NAME, AUTHORITY_NAME):

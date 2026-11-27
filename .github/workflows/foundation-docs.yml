@@ -76,6 +76,7 @@ jobs:
             "docs/security/GATE_0_1_13_INDEPENDENT_AUTHORITY_AUDIT.md"
             "docs/security/GATE_0_1_13_1_SIGNED_RECEIPTS_FENCING.md"
             "docs/security/GATE_0_1_13_2_PERSISTENT_RECEIPT_FLOOR.md"
+            "docs/security/GATE_0_1_13_3_DURABLE_RECEIPT_RECOVERY.md"
           )
           for file in "${required_files[@]}"; do
             git ls-files --error-unmatch -- "$file" >/dev/null
