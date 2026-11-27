@@ -13,10 +13,13 @@ from pathlib import Path
 
 from broker import Broker, Denied
 from actor_broker import ActorBroker
+from independent_authority import R2Proof, AuthorityDenied
 from recovery_state import RecoveryState, initialize, advance, read_state
 
 ROOT = Path(__file__).resolve().parent
 NAME = "cephas-proof-" + secrets.token_hex(6)
+AUTHORITY_NAME = NAME + "-authority"
+AUTHORITY_PASSWORD = secrets.token_hex(24)
 PASSWORDS = {role: secrets.token_hex(24) for role in
              ("postgres", "proof_runtime", "proof_issuer_a", "proof_issuer_b",
               "proof_a1", "proof_a2", "proof_b1", "proof_b2",
@@ -31,15 +34,15 @@ def docker(*args, **kwargs):
     return subprocess.run(["docker", *args], check=True, text=True, **kwargs)
 
 
-def command(role):
-    return ["docker", "exec", "-i", "-e", "PGPASSWORD=" + PASSWORDS[role],
-            NAME, "psql", "-X", "-qAt", "-h", "127.0.0.1", "-U", role,
+def command(role, container=NAME, password=None):
+    return ["docker", "exec", "-i", "-e", "PGPASSWORD=" + (PASSWORDS[role] if password is None else password),
+            container, "psql", "-X", "-qAt", "-h", "127.0.0.1", "-U", role,
             "-d", "postgres", "-P", "pager=off"]
 
 
 class Session:
-    def __init__(self, role):
-        self.p = subprocess.Popen(command(role), stdin=subprocess.PIPE,
+    def __init__(self, role, container=NAME, password=None):
+        self.p = subprocess.Popen(command(role, container, password), stdin=subprocess.PIPE,
                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                   text=True, bufsize=1)
 
@@ -258,6 +261,95 @@ class Boundary(unittest.TestCase):
         actor.query("SELECT auth.current_epoch()", "42501")
         self.ia.query(f"SELECT auth.bind_self('A','1','{self.actor_epoch()}')", "42501")
         self.a.query(f"SELECT auth.bind_self('A','1','{self.actor_epoch()}')", "42501")
+
+    def r2_fixture(self):
+        authority = Session("postgres", AUTHORITY_NAME, AUTHORITY_PASSWORD)
+        self.sessions.append(authority)
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        return R2Proof(self.admin, authority, Path(directory.name) / "local.sqlite")
+
+    def test_f02_f03_external_head_rejects_coordinated_restore(self):
+        r = self.r2_fixture()
+        original = r.local.read_bytes()
+        dump = subprocess.run(["docker","exec","-e","PGPASSWORD="+PASSWORDS["postgres"],NAME,
+            "pg_dump","-h","127.0.0.1","-U","postgres","-d","postgres","--data-only",
+            "--table=r2.epoch","--table=r2.effect","--table=r2.outbox","--format=custom"],
+            check=True,capture_output=True).stdout
+        r.mutate("event1")
+        r.quarantine()
+        r.reconcile_epoch()
+        r.activate()
+        self.assertEqual(r.guard().sequence,2)
+        self.admin.query("TRUNCATE r2.effect,r2.outbox,r2.epoch")
+        subprocess.run(["docker","exec","-i","-e","PGPASSWORD="+PASSWORDS["postgres"],NAME,
+            "pg_restore","-h","127.0.0.1","-U","postgres","-d","postgres","--data-only","--exit-on-error"],
+            input=dump,check=True,capture_output=True)
+        r.local.write_bytes(original)
+        with self.assertRaises(AuthorityDenied):
+            r.guard()
+        with self.assertRaises(AuthorityDenied):
+            r.mutate("event2")
+        self.assertEqual(r.external().sequence,2)
+
+    def test_f02_quarantine_interrupted_cutover_requires_reconciliation(self):
+        r = self.r2_fixture()
+        r.mutate("event1")
+        r.quarantine()
+        with self.assertRaises(AuthorityDenied):
+            r.guard()
+        with self.assertRaises(AuthorityDenied):
+            r.activate()
+        r.reconcile_epoch()
+        with self.assertRaises(AuthorityDenied):
+            r.guard()
+        r.activate()
+        self.assertEqual(r.guard().sequence,2)
+
+    def test_f03_tamper_truncate_and_fork_detected(self):
+        r = self.r2_fixture()
+        r.mutate("event1")
+        r.mutate("event2")
+        self.admin.query("UPDATE r2.outbox SET payload='{}' WHERE seq=1")
+        with self.assertRaises(AuthorityDenied):
+            r.guard()
+        self.admin.query("DELETE FROM r2.outbox")
+        with self.assertRaises(AuthorityDenied):
+            r.guard()
+        with self.assertRaises(AuthorityDenied):
+            r.mutate("event3")
+
+    def test_f03_atomic_effect_and_outbox_rollback(self):
+        r = self.r2_fixture()
+        self.admin.query("BEGIN")
+        self.admin.query("SELECT r2.apply('rollback1')")
+        self.admin.query("ROLLBACK")
+        self.assertEqual(r.guard().audit_sequence,0)
+        self.assertEqual(self.admin.query("SELECT count(*) FROM r2.effect"),["0"])
+        self.assertEqual(r.mutate("event1").audit_sequence,1)
+        self.assertEqual(self.admin.query("SELECT count(*) FROM r2.effect"),["1"])
+
+    def test_f02_f03_unanchored_commit_denies_until_operator_recovery(self):
+        r = self.r2_fixture()
+        self.admin.query("SELECT r2.apply('unanchored')")
+        with self.assertRaises(AuthorityDenied):
+            r.guard()
+        with self.assertRaises(AuthorityDenied):
+            r.mutate("event2")
+        r.quarantine()
+        with self.assertRaises(AuthorityDenied):
+            r.reconcile_epoch()
+        self.assertEqual(r.external().audit_sequence,0)
+
+    def test_f02_authority_unavailable_and_runtime_access_denied(self):
+        r = self.r2_fixture()
+        self.a.query("SELECT * FROM r2.outbox","42501")
+        self.a.query("SELECT r2.apply('forbidden')","42501")
+        r.authority.query("DROP SCHEMA anchor CASCADE")
+        with self.assertRaises(AuthorityDenied):
+            r.guard()
+        with self.assertRaises(AuthorityDenied):
+            r.mutate("event1")
 
     def recovery_fixture(self):
         directory = tempfile.TemporaryDirectory()
@@ -815,9 +907,9 @@ class Boundary(unittest.TestCase):
         self.a.query("ROLLBACK")
 
 
-def wait_ready():
+def wait_ready(container=NAME):
     for _ in range(60):
-        ready = subprocess.run(["docker", "exec", NAME, "pg_isready", "-h", "127.0.0.1"],
+        ready = subprocess.run(["docker", "exec", container, "pg_isready", "-h", "127.0.0.1"],
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         if ready.returncode == 0:
             return
@@ -841,6 +933,11 @@ def main():
                "-e", "POSTGRES_INITDB_ARGS=--auth-host=scram-sha-256",
                digest, stdout=subprocess.DEVNULL)
         wait_ready()
+        docker("run", "-d", "--network", "none", "--name", AUTHORITY_NAME,
+               "-e", "POSTGRES_PASSWORD=" + AUTHORITY_PASSWORD,
+               "-e", "POSTGRES_INITDB_ARGS=--auth-host=scram-sha-256",
+               digest, stdout=subprocess.DEVNULL)
+        wait_ready(AUTHORITY_NAME)
         args = command("postgres") + ["-v","ON_ERROR_STOP=1",
                  "-v","runtime_pw="+PASSWORDS["proof_runtime"],
                  "-v","issuer_a_pw="+PASSWORDS["proof_issuer_a"],
@@ -858,10 +955,11 @@ def main():
         print("Server:", with_version.stdout.strip(), "merge SHA:", os.environ.get("GITHUB_SHA", "local"),
               "PR head:", os.environ.get("PROOF_PR_HEAD", "local"), flush=True)
         result = unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromTestCase(Boundary))
-        if not result.wasSuccessful() or result.skipped or result.testsRun != 49:
+        if not result.wasSuccessful() or result.skipped or result.testsRun != 55:
             raise SystemExit(1)
     finally:
-        subprocess.run(["docker","rm","-f","-v",NAME],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+        for container in (NAME, AUTHORITY_NAME):
+            subprocess.run(["docker","rm","-f","-v",container],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
 
 
 if __name__ == "__main__":
