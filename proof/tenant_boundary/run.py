@@ -279,7 +279,7 @@ class Boundary(unittest.TestCase):
         r.mutate("event1")
         r.quarantine()
         r.reconcile_epoch()
-        r.activate()
+        r.activate(r.external().epoch)
         self.assertEqual(r.guard().sequence,2)
         self.admin.query("TRUNCATE r2.effect,r2.outbox,r2.epoch")
         subprocess.run(["docker","exec","-i","-e","PGPASSWORD="+PASSWORDS["postgres"],NAME,
@@ -299,11 +299,11 @@ class Boundary(unittest.TestCase):
         with self.assertRaises(AuthorityDenied):
             r.guard()
         with self.assertRaises(AuthorityDenied):
-            r.activate()
+            r.activate(r.external().epoch)
         r.reconcile_epoch()
         with self.assertRaises(AuthorityDenied):
             r.guard()
-        r.activate()
+        r.activate(r.external().epoch)
         self.assertEqual(r.guard().sequence,2)
 
     def test_f03_tamper_truncate_and_fork_detected(self):
@@ -350,6 +350,83 @@ class Boundary(unittest.TestCase):
             r.guard()
         with self.assertRaises(AuthorityDenied):
             r.mutate("event1")
+
+    def test_f03_receipt_tamper_and_unsigned_head_denied(self):
+        r = self.r2_fixture()
+        r.mutate("event1")
+        head=r.external()
+        r.authority.query("UPDATE anchor.head SET digest=repeat('a',64)")
+        with self.assertRaises(AuthorityDenied):
+            r.guard()
+        r.authority.query(f"UPDATE anchor.head SET digest='{head.digest}'")
+        self.assertEqual(r.guard(),head)
+        r.authority.query("UPDATE anchor.receipt SET signature=repeat('0',128) WHERE revision=2")
+        with self.assertRaises(AuthorityDenied):
+            r.external()
+
+    def test_f03_valid_old_receipt_replay_denied_by_live_floor(self):
+        r = self.r2_fixture()
+        r.mutate("event1")
+        r.authority.query("DELETE FROM anchor.receipt WHERE revision=2")
+        r.authority.query("UPDATE anchor.head SET audit_seq=0,digest=repeat('0',64)")
+        self.admin.query("TRUNCATE r2.effect,r2.outbox")
+        with self.assertRaises(AuthorityDenied):
+            r.guard()
+
+    def test_f03_rehashed_audit_fork_denied(self):
+        r = self.r2_fixture()
+        r.mutate("event1")
+        r.mutate("event2")
+        # Rewrite a valid-looking complete history with the same event count.
+        self.admin.query("TRUNCATE r2.effect,r2.outbox")
+        self.admin.query("SELECT r2.apply('fork1')")
+        self.admin.query("SELECT r2.apply('fork2')")
+        with self.assertRaises(AuthorityDenied):
+            r.guard()
+
+    def test_f02_stale_activation_epoch_denied(self):
+        r = self.r2_fixture()
+        previous=r.external().epoch
+        expected=r.quarantine()
+        r.reconcile_epoch()
+        with self.assertRaises(AuthorityDenied):
+            r.activate(previous)
+        self.assertEqual(r.external().phase,"quarantine")
+        r.activate(expected)
+        self.assertEqual(r.guard().epoch,expected)
+
+    def test_f02_concurrent_mutation_and_quarantine_are_serialized(self):
+        from copy import copy
+        from threading import Barrier
+        r = self.r2_fixture()
+        other = copy(r)
+        other.primary = self.open("postgres")
+        other.authority = Session("postgres",AUTHORITY_NAME,AUTHORITY_PASSWORD)
+        self.sessions.append(other.authority)
+        barrier=Barrier(2,timeout=10)
+        def mutate():
+            barrier.wait()
+            try:
+                r.mutate("race1")
+                return "committed"
+            except AuthorityDenied:
+                return "denied"
+        def quarantine():
+            barrier.wait()
+            return other.quarantine()
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            m=pool.submit(mutate)
+            q=pool.submit(quarantine)
+            outcome=m.result(timeout=25)
+            epoch=q.result(timeout=25)
+        self.assertEqual(r.external().phase,"quarantine")
+        self.assertEqual(r.external().epoch,epoch)
+        self.assertEqual(r.external().audit_sequence,1 if outcome=="committed" else 0)
+        with self.assertRaises(AuthorityDenied):
+            r.mutate("after_fence")
+        other.reconcile_epoch()
+        other.activate(epoch)
+        self.assertEqual(other.guard().phase,"active")
 
     def recovery_fixture(self):
         directory = tempfile.TemporaryDirectory()
@@ -955,7 +1032,7 @@ def main():
         print("Server:", with_version.stdout.strip(), "merge SHA:", os.environ.get("GITHUB_SHA", "local"),
               "PR head:", os.environ.get("PROOF_PR_HEAD", "local"), flush=True)
         result = unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromTestCase(Boundary))
-        if not result.wasSuccessful() or result.skipped or result.testsRun != 55:
+        if not result.wasSuccessful() or result.skipped or result.testsRun != 60:
             raise SystemExit(1)
     finally:
         for container in (NAME, AUTHORITY_NAME):

@@ -1,7 +1,7 @@
 """Two-cluster disposable recovery and audit proof.
 
 Both clusters are controlled by a single CI operator. No production custody,
-WORM, external signed receipts or service network authentication is claimed.
+WORM or service network authentication is claimed. Receipts are synthetic.
 """
 import hashlib
 import json
@@ -9,6 +9,7 @@ import re
 import uuid
 from dataclasses import dataclass
 from recovery_state import initialize, advance, read_state, RecoveryState
+from authority_receipt import TestSigner, canonical, verify, transition
 
 ZERO = "0" * 64
 
@@ -43,6 +44,10 @@ class R2Proof:
         self.authority = authority
         self.local = local
         epoch = str(uuid.uuid4())
+        self.deployment = str(uuid.uuid4())
+        self.signer = TestSigner(local.parent)
+        self.public = self.signer.public
+        self._floor = (0, ZERO)
         # Per-test schemas; explicit operator-only setup, never startup repair.
         primary.query("DROP SCHEMA IF EXISTS r2 CASCADE")
         authority.query("DROP SCHEMA IF EXISTS anchor CASCADE")
@@ -80,7 +85,43 @@ class R2Proof:
         authority.query("CREATE TABLE anchor.history(epoch uuid PRIMARY KEY, seq bigint NOT NULL UNIQUE)")
         authority.query(f"INSERT INTO anchor.head VALUES(true,1,'{epoch}','active',0,'{ZERO}')")
         authority.query(f"INSERT INTO anchor.history VALUES('{epoch}',1)")
+        authority.query("CREATE TABLE anchor.receipt(revision bigint PRIMARY KEY, payload text NOT NULL, signature text NOT NULL)")
+        self._append_receipt(Head(1,epoch,"active",0,ZERO), None, ZERO)
         initialize(local, epoch)
+        self.guard()
+
+    def _receipt_head(self):
+        rows = self.authority.query("SELECT revision,payload,signature FROM anchor.receipt ORDER BY revision LIMIT 4097")
+        demand(0 < len(rows) <= 4096)
+        prior, previous = None, ZERO
+        seen_epochs = set()
+        floor_seen = self._floor[0] == 0
+        for row in rows:
+            revision, body, sig = row.split("|")
+            payload, digest = verify(self.public, bytes.fromhex(body), bytes.fromhex(sig), self.deployment)
+            demand(int(revision) == payload["revision"])
+            transition(prior, payload, previous)
+            if prior is None or payload["epoch"] != prior["epoch"]:
+                demand(payload["epoch"] not in seen_epochs)
+                seen_epochs.add(payload["epoch"])
+            if payload["revision"] == self._floor[0]:
+                demand(digest == self._floor[1])
+                floor_seen = True
+            prior, previous = payload, digest
+        demand(floor_seen)
+        return prior, previous
+
+    def _append_receipt(self, head, prior, previous):
+        payload={"version":1,"deployment":self.deployment,
+                 "revision":1 if prior is None else prior["revision"]+1,
+                 "previous":previous,"sequence":head.sequence,"epoch":head.epoch,
+                 "phase":head.phase,"audit_sequence":head.audit_sequence,"digest":head.digest}
+        transition(prior,payload,previous)
+        raw=canonical(payload)
+        signature=self.signer.sign(raw)
+        _, digest=verify(self.public,raw,signature,self.deployment)
+        self.authority.query(f"INSERT INTO anchor.receipt VALUES({payload['revision']},'{raw.hex()}','{signature.hex()}')")
+        return payload["revision"],digest
 
     def external(self, lock=False):
         try:
@@ -90,7 +131,11 @@ class R2Proof:
             seq, epoch, phase, audit, digest = rows[0].split("|")
             demand(str(uuid.UUID(epoch)) == epoch and phase in ("active", "quarantine"))
             demand(re.fullmatch(r"[0-9a-f]{64}", digest) and int(seq) > 0 and int(audit) >= 0)
-            return Head(int(seq), epoch, phase, int(audit), digest)
+            head = Head(int(seq), epoch, phase, int(audit), digest)
+            receipt, _ = self._receipt_head()
+            demand(head == Head(receipt['sequence'],receipt['epoch'],receipt['phase'],
+                                receipt['audit_sequence'],receipt['digest']))
+            return head
         except Exception:
             raise AuthorityDenied("authority unavailable") from None
 
@@ -128,16 +173,22 @@ class R2Proof:
 
     def guard(self):
         try:
-            return self._match(self.external())
+            return self._locked(self._match)
         except Exception:
             raise AuthorityDenied("protected operation denied") from None
 
     def _locked(self, action):
         try:
             self.authority.query("BEGIN")
+            self.authority.query("SET LOCAL lock_timeout='5s'")
             head = self.external(lock=True)
+            prior, previous = self._receipt_head()
             result = action(head)
+            floor = (prior["revision"],previous)
+            if isinstance(result,Head) and result != head:
+                floor = self._append_receipt(result,prior,previous)
             self.authority.query("COMMIT")
+            self._floor = floor
             return result
         except Exception:
             try:
@@ -154,6 +205,8 @@ class R2Proof:
             # between them, mismatch blocks later operations, no auto-adoption.
             digest = self.primary.query(f"SELECT r2.apply('{event_id}')")[0]
             demand(self.local_head() == (head.audit_sequence + 1, digest))
+            if head.audit_sequence:
+                demand(self.primary.query(f"SELECT digest FROM r2.outbox WHERE seq={head.audit_sequence}") == [head.digest])
             rows = self.authority.query(f"UPDATE anchor.head SET audit_seq=audit_seq+1,digest='{digest}' "
                                         "WHERE singleton RETURNING audit_seq")
             demand(rows == [str(head.audit_sequence+1)])
@@ -166,8 +219,8 @@ class R2Proof:
             epoch = str(uuid.uuid4())
             self.authority.query(f"INSERT INTO anchor.history VALUES('{epoch}',{head.sequence+1})")
             self.authority.query(f"UPDATE anchor.head SET seq=seq+1,epoch='{epoch}',phase='quarantine' WHERE singleton")
-            return epoch
-        return self._locked(begin)
+            return Head(head.sequence+1,epoch,'quarantine',head.audit_sequence,head.digest)
+        return self._locked(begin).epoch
 
     def reconcile_epoch(self):
         def reconcile(head):
@@ -188,9 +241,9 @@ class R2Proof:
             return head
         return self._locked(reconcile)
 
-    def activate(self):
+    def activate(self, expected_epoch):
         def activate(head):
-            demand(head.phase == "quarantine")
+            demand(head.phase == "quarantine" and head.epoch == expected_epoch)
             self._match(head,active=False)
             self.authority.query("UPDATE anchor.head SET phase='active' WHERE singleton")
             return Head(head.sequence,head.epoch,"active",head.audit_sequence,head.digest)

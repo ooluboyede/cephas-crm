@@ -30,3 +30,5 @@ Gate 0.1.12 adds six candidate F-01 actor-specific self-binding tests (45 Postgr
 Gate 0.1.12.1 pins the candidate actor broker transaction identity and bounds self-bind expiry to transaction start; four new tests plus shared real-expiry assertions. See docs/security/GATE_0_1_12_1_ACTOR_BOUNDARY.md. Expected 49 PostgreSQL tests; no production identity integration.
 
 Gate 0.1.13 adds a second isolated disposable cluster and six R2 tests (55 PostgreSQL expected), separate random authority password and cleanup of both volumes. See docs/security/GATE_0_1_13_INDEPENDENT_AUTHORITY_AUDIT.md. No independent production administrator custody or application integration claimed.
+
+Gate 0.1.13.1 adds signed receipt verification, live floor, cooperative authority lock and five tests (60 PostgreSQL expected). See docs/security/GATE_0_1_13_1_SIGNED_RECEIPTS_FENCING.md for limitations.
