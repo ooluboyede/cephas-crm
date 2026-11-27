@@ -67,6 +67,9 @@ jobs:
             "docs/licensing/GATE_0_1_10_3_CRM_TIER_POLICY.md"
             "docs/security/GATE_0_1_10_3_PERSISTENT_UNIVERSAL_STATE.md"
             "docs/security/GATE_0_1_10_4_RENEWAL_GOVERNANCE.md"
+            "docs/engineering/GATE_0_1_11_CONSOLIDATED_ACCEPTANCE.md"
+            "docs/engineering/GATE_0_1_11_OWNER_DECISION_REGISTER.md"
+            "docs/engineering/GATE_0_1_11_INDEPENDENT_REVIEW_BRIEF.md"
           )
           for file in "${required_files[@]}"; do
             git ls-files --error-unmatch -- "$file" >/dev/null
