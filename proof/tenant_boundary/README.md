@@ -38,3 +38,5 @@ Gate 0.1.13.2 adds a separately retained persistent receipt witness, explicit re
 Gate 0.1.13.3 retains signed receipts in witness CAS and adds explicit one-step quarantine recovery plus a standalone rotation certificate verifier (70 PostgreSQL tests expected). See docs/security/GATE_0_1_13_3_DURABLE_RECEIPT_RECOVERY.md. No production rotation or independent custody.
 
 Gate 0.1.14 adds RS256 OIDC ID-token verification and synthetic server session integration with the cooperative actor fence (76 PostgreSQL tests expected). See docs/security/GATE_0_1_14_IDENTITY_AND_LICENSING_BOUNDARY.md; no live IdP or authorization code flow claimed.
+
+Gate 0.1.14.1 corrects two Run #29 test-harness failures and adds synthetic PKCE callback and bounded session tests (80 PostgreSQL expected). See docs/security/GATE_0_1_14_1_CALLBACK_SESSION_REMEDIATION.md. No real IdP transport claimed.

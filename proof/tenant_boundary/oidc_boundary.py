@@ -5,6 +5,8 @@ TLS/JWKS retrieval, actual PKCE code exchange, cookies and production IdP are
 not implemented. OpenSSL supplies RS256 verification, not custom RSA math.
 """
 import base64
+import hashlib
+import hmac
 import json
 import re
 import secrets
@@ -100,6 +102,10 @@ class OIDCVerifier:
         self._last_time=now
         return now
 
+    def now(self):
+        with self._lock:
+            return self._now()
+
     def install_keys(self,generation,jwks,ttl):
         # Trusted configuration/transport only; never called with token-supplied URL.
         with self._lock:
@@ -160,33 +166,90 @@ class OIDCVerifier:
 
 class SessionGate:
     """Trusted in-process session adapter with fixed principal/operation mapping."""
-    def __init__(self,verifier,principals,credentials,authority,factory):
+    def __init__(self,verifier,principals,credentials,authority,factory,exchange=None):
         self._verifier=verifier
         self._principals=MappingProxyType(dict(principals))
         self._credentials=MappingProxyType(dict(credentials))
         self._authority=authority
         self._factory=factory
         self._pending={}
+        self._code_pending={}
         self._sessions={}
+        self._exchange=exchange
+        self._redirect='https://crm.example.invalid/oidc/callback'
         self._lock=threading.RLock()
 
+    def _prune(self,now):
+        for store in (self._pending,self._code_pending):
+            for key,value in list(store.items()):
+                if now>=value[-1]:
+                    del store[key]
+        for key,value in list(self._sessions.items()):
+            if now>=value[3] or now>=value[4]+30:
+                del self._sessions[key]
+
     def begin(self):
+        # Legacy trusted post-exchange test path only, not a public callback.
         with self._lock:
-            need(len(self._pending)<128)
+            now=self._verifier.now()
+            self._prune(now)
+            need(len(self._pending)+len(self._code_pending)<128)
             state,nonce=secrets.token_hex(32),secrets.token_hex(32)
-            self._pending[state]=nonce
+            self._pending[state]=(nonce,now+60)
             return state,nonce
 
+    def _issue_session(self,token,nonce,now):
+        need(len(self._sessions)<128)
+        principal,_,_,exp=self._verifier.verify(token,nonce)
+        need(principal in self._principals)
+        session=secrets.token_hex(32)
+        self._sessions[session]=(token,nonce,principal,min(now+60,exp),now)
+        return session
+
     def complete(self,state,token):
-        # Trusted callback only. Consume state even on failed validation.
+        # Trusted post-exchange regression only; not exposed to browser.
         with self._lock:
-            nonce=self._pending.pop(state,None)
-            need(nonce is not None and len(self._sessions)<128)
-            principal,_,_,_=self._verifier.verify(token,nonce)
-            need(principal in self._principals)
-            session=secrets.token_hex(32)
-            self._sessions[session]=(token,nonce,principal)
-            return session
+            now=self._verifier.now()
+            self._prune(now)
+            entry=self._pending.pop(state,None)
+            need(entry is not None)
+            return self._issue_session(token,entry[0],now)
+
+    def begin_code(self,browser_binding):
+        # browser_binding supplied by trusted server transport, not request body.
+        with self._lock:
+            need(callable(self._exchange))
+            need(type(browser_binding) is str and re.fullmatch(r"[0-9a-f]{64}",browser_binding))
+            now=self._verifier.now()
+            self._prune(now)
+            need(len(self._pending)+len(self._code_pending)<128)
+            state,nonce=secrets.token_hex(32),secrets.token_hex(32)
+            verifier=secrets.token_urlsafe(48)
+            challenge=b64(hashlib.sha256(verifier.encode("ascii")).digest())
+            self._code_pending[state]=(nonce,verifier,browser_binding,now+60)
+            return {"response_type":"code","state":state,"nonce":nonce,
+                    "code_challenge":challenge,"code_challenge_method":"S256",
+                    "client_id":self._verifier.audience,"redirect_uri":self._redirect,
+                    "scope":"openid"}
+
+    def complete_code(self,state,code,browser_binding,callback_issuer):
+        # Exchange is injected at trusted startup; no caller-specified endpoint,
+        # redirect URI, code verifier, or token. Consume state before exchange.
+        try:
+            with self._lock:
+                now=self._verifier.now()
+                self._prune(now)
+                entry=self._code_pending.pop(state,None)
+                need(entry is not None)
+                nonce,verifier,binding,_=entry
+                need(type(browser_binding) is str and re.fullmatch(r"[0-9a-f]{64}",browser_binding)
+                     and hmac.compare_digest(binding,browser_binding))
+                need(callback_issuer==self._verifier.issuer)
+                need(type(code) is str and re.fullmatch(r"[A-Za-z0-9_-]{1,256}",code))
+                token=self._exchange(code,verifier,self._redirect,self._verifier.audience)
+                return self._issue_session(token,nonce,self._verifier.now())
+        except Exception:
+            raise Denied("identity denied") from None
 
     def logout(self,session):
         with self._lock:
@@ -195,9 +258,11 @@ class SessionGate:
     def execute(self,session,tenant,bu,operation):
         try:
             with self._lock:
+                now=self._verifier.now()
+                self._prune(now)
                 entry=self._sessions.get(session)
                 need(entry is not None)
-                token,nonce,principal=entry
+                token,nonce,principal,deadline,_=entry
                 actual,acr,_,_=self._verifier.verify(token,nonce)
                 need(actual==principal)
                 actor=self._principals.get(principal)
@@ -207,7 +272,11 @@ class SessionGate:
                 # client claims of role/membership. Database checks live membership.
                 if operation=="list_notes":
                     need(acr=="urn:cephas:proof:mfa")
-                return self._authority.fenced_read(self._credentials,self._factory,
+                rows=self._authority.fenced_read(self._credentials,self._factory,
                     self._credentials[actor],tenant,bu,operation)
+                finished=self._verifier.now()
+                need(finished<deadline and finished<now+30)
+                self._sessions[session]=(token,nonce,principal,deadline,finished)
+                return rows
         except Exception:
             raise Denied("identity denied") from None

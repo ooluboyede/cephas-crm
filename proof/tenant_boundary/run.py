@@ -38,6 +38,7 @@ def docker(*args, **kwargs):
 
 def command(role, container=NAME, password=None):
     return ["docker", "exec", "-i", "-e", "PGPASSWORD=" + (PASSWORDS[role] if password is None else password),
+            "-e", "PGOPTIONS=-c client_min_messages=error",
             container, "psql", "-X", "-qAt", "-h", "127.0.0.1", "-U", role,
             "-d", "postgres", "-P", "pager=off"]
 
@@ -622,10 +623,10 @@ class Boundary(unittest.TestCase):
         principals={(issuer,"subject-alice"):"alice",(issuer,"subject-charlie"):"charlie",
                     (issuer,"subject-bob"):"bob"}
         tokens={a:secrets.token_hex(32) for a in ("alice","charlie","bob")}
-        gate=SessionGate(verifier,principals,tokens,r,Session)
-        def claims(nonce,**changes):
+        gate=SessionGate(verifier,principals,tokens,r,Session,exchange=idp.exchange)
+        def claims(expected_nonce,**changes):
             value={"iss":issuer,"aud":"cephas-crm-proof","sub":"subject-alice",
-                   "nonce":nonce,"iat":now[0],"exp":now[0]+120,"auth_time":now[0],
+                   "nonce":expected_nonce,"iat":now[0],"exp":now[0]+120,"auth_time":now[0],
                    "acr":"urn:cephas:proof:mfa"}
             value.update(changes)
             return value
@@ -711,6 +712,71 @@ class Boundary(unittest.TestCase):
         finally:
             self.admin.query("UPDATE auth.membership SET active=true,revision=revision+1 WHERE principal='alice' AND tenant='A' AND bu='1'")
         r.quarantine()
+        with self.assertRaises(Denied):
+            gate.execute(session,"A","1","list_items")
+
+    def test_f05_pkce_code_callback_binds_browser_and_consumes_code(self):
+        r,now,idp,verifier,gate,claims=self.oidc_fixture()
+        browser=secrets.token_hex(32)
+        request=gate.begin_code(browser)
+        self.assertEqual(request["code_challenge_method"],"S256")
+        self.assertNotIn("code_verifier",request)
+        code=idp.authorize(request,claims(request["nonce"]))
+        session=gate.complete_code(request["state"],code,browser,verifier.issuer)
+        self.assertEqual(gate.execute(session,"A","1","list_items"),["A1"])
+        with self.assertRaises(Denied):
+            gate.complete_code(request["state"],code,browser,verifier.issuer)
+        request2=gate.begin_code(browser)
+        with self.assertRaises(Denied):
+            gate.complete_code(request2["state"],code,browser,verifier.issuer)
+
+    def test_f05_pkce_wrong_browser_issuer_and_verifier_denied(self):
+        r,now,idp,verifier,gate,claims=self.oidc_fixture()
+        browser=secrets.token_hex(32)
+        for actual_browser,issuer in ((secrets.token_hex(32),verifier.issuer),
+                                      (browser,"https://foreign.invalid")):
+            request=gate.begin_code(browser)
+            code=idp.authorize(request,claims(request["nonce"]))
+            with self.assertRaises(Denied):
+                gate.complete_code(request["state"],code,actual_browser,issuer)
+            with self.assertRaises(Denied):
+                gate.complete_code(request["state"],code,browser,verifier.issuer)
+        request=gate.begin_code(browser)
+        code=idp.authorize(request,claims(request["nonce"]))
+        with self.assertRaises(Denied):
+            idp.exchange(code,"wrong-verifier",request["redirect_uri"],request["client_id"])
+        with self.assertRaises(Denied):
+            gate.complete_code(request["state"],code,browser,verifier.issuer)
+
+    def test_f05_expired_callback_and_idle_session_denied(self):
+        r,now,idp,verifier,gate,claims=self.oidc_fixture()
+        browser=secrets.token_hex(32)
+        pending=gate.begin_code(browser)
+        code=idp.authorize(pending,claims(pending["nonce"]))
+        now[0]+=60
+        verifier.install_keys(2,{"keys":[idp.jwk]},300)
+        with self.assertRaises(Denied):
+            gate.complete_code(pending["state"],code,browser,verifier.issuer)
+        pending=gate.begin_code(browser)
+        code=idp.authorize(pending,claims(pending["nonce"]))
+        session=gate.complete_code(pending["state"],code,browser,verifier.issuer)
+        now[0]+=29
+        self.assertEqual(gate.execute(session,"A","1","list_items"),["A1"])
+        now[0]+=30
+        with self.assertRaises(Denied):
+            gate.execute(session,"A","1","list_items")
+
+    def test_f05_session_absolute_deadline_not_extended_by_activity(self):
+        r,now,idp,verifier,gate,claims=self.oidc_fixture()
+        verifier.install_keys(2,{"keys":[idp.jwk]},300)
+        browser=secrets.token_hex(32)
+        pending=gate.begin_code(browser)
+        code=idp.authorize(pending,claims(pending["nonce"]))
+        session=gate.complete_code(pending["state"],code,browser,verifier.issuer)
+        for _ in range(3):
+            now[0]+=19
+            self.assertEqual(gate.execute(session,"A","1","list_items"),["A1"])
+        now[0]+=3
         with self.assertRaises(Denied):
             gate.execute(session,"A","1","list_items")
 
@@ -1318,7 +1384,7 @@ def main():
         print("Server:", with_version.stdout.strip(), "merge SHA:", os.environ.get("GITHUB_SHA", "local"),
               "PR head:", os.environ.get("PROOF_PR_HEAD", "local"), flush=True)
         result = unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromTestCase(Boundary))
-        if not result.wasSuccessful() or result.skipped or result.testsRun != 76:
+        if not result.wasSuccessful() or result.skipped or result.testsRun != 80:
             raise SystemExit(1)
     finally:
         for container in (NAME, AUTHORITY_NAME):
