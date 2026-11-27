@@ -64,6 +64,8 @@ jobs:
             "docs/security/GATE_0_1_10_1_ISSUER_STATE_ASSURANCE.md"
             "docs/security/GATE_0_1_10_2_UNIVERSAL_VALIDATOR.md"
             "proof/universal_licence/README.md"
+            "docs/licensing/GATE_0_1_10_3_CRM_TIER_POLICY.md"
+            "docs/security/GATE_0_1_10_3_PERSISTENT_UNIVERSAL_STATE.md"
           )
           for file in "${required_files[@]}"; do
             git ls-files --error-unmatch -- "$file" >/dev/null
@@ -120,4 +122,4 @@ jobs:
       - name: Run universal issuer compatibility proof
         run: |
           node --version
-          node --test proof/universal_licence/validator.test.mjs
+          node --test proof/universal_licence/validator.test.mjs proof/universal_licence/state.test.mjs
