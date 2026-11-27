@@ -49,6 +49,9 @@ jobs:
             "docs/security/GATE_0_1_4_THREAT_MODEL.md"
             "docs/security/GATE_0_1_5_TENANT_IDENTITY_BOUNDARY.md"
             "docs/engineering/GATE_0_1_6_DEPENDENCY_CI_GOVERNANCE.md"
+            "docs/licensing/GATE_0_1_7_LICENCE_PROTOCOL.md"
+            "docs/architecture/GATE_0_1_7_PLATFORM_BLUEPRINT.md"
+            "docs/engineering/GATE_0_1_7_CLOSURE_AND_REVIEW.md"
           )
           for file in "${required_files[@]}"; do
             git ls-files --error-unmatch -- "$file" >/dev/null
