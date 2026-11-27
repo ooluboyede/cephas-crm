@@ -5,10 +5,14 @@ import secrets
 import subprocess
 import time
 import unittest
+import tempfile
+import sqlite3
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from broker import Broker, Denied
+from recovery_state import RecoveryState, initialize, advance, read_state
 
 ROOT = Path(__file__).resolve().parent
 NAME = "cephas-proof-" + secrets.token_hex(6)
@@ -114,8 +118,97 @@ class Boundary(unittest.TestCase):
 
     def broker(self, factory=Session):
         tokens = {actor: secrets.token_hex(32) for actor in ("alice", "bob")}
+        # Explicit trusted test-operator setup; never adopt restored DB state in production.
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        journal = Path(directory.name) / "recovery.sqlite"
         epoch = self.admin.query("SELECT value FROM auth.epoch")[0]
-        return Broker(tokens, factory, epoch), tokens
+        initialize(journal, epoch)
+        return Broker(tokens, factory, lambda: read_state(journal)), tokens
+
+    def recovery_fixture(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        journal = Path(directory.name) / "recovery.sqlite"
+        epoch = self.admin.query("SELECT value FROM auth.epoch")[0]
+        state = initialize(journal, epoch)
+        tokens = {actor: secrets.token_hex(32) for actor in ("alice", "bob")}
+        return journal, state, tokens
+
+    def test_p06_journal_survives_broker_reconstruction(self):
+        journal, state, tokens = self.recovery_fixture()
+        for _ in range(2):
+            broker = Broker(tokens, Session, lambda: read_state(journal))
+            self.assertEqual(read_state(journal), state)
+            self.assertEqual(broker.execute(tokens["alice"], "A", "1", "list_items"), ["A1"])
+
+    def test_p06_journal_missing_or_corrupt_denied(self):
+        journal, state, tokens = self.recovery_fixture()
+        broker = Broker(tokens, Session, lambda: read_state(journal))
+        journal.unlink()
+        with self.assertRaises(Denied):
+            broker.execute(tokens["alice"], "A", "1", "list_items")
+        with self.assertRaises(Denied):
+            Broker(tokens, Session, lambda: read_state(journal))
+        journal.write_bytes(b"invalid sqlite")
+        with self.assertRaises(Denied):
+            Broker(tokens, Session, lambda: read_state(journal))
+        self.assertEqual(state.sequence, 1)
+
+    def test_p06_journal_compare_append_and_epoch_reuse(self):
+        journal, initial, _ = self.recovery_fixture()
+        with self.assertRaises(FileExistsError):
+            initialize(journal, str(uuid.uuid4()))
+        second = advance(journal, initial, str(uuid.uuid4()))
+        self.assertEqual(second.sequence, 2)
+        with self.assertRaises(ValueError):
+            advance(journal, initial, str(uuid.uuid4()))
+        with self.assertRaises(sqlite3.IntegrityError):
+            advance(journal, second, initial.epoch)
+        self.assertEqual(read_state(journal), second)
+
+    def test_p06_journal_concurrent_advance_single_winner(self):
+        journal, initial, _ = self.recovery_fixture()
+        def attempt():
+            try:
+                return advance(journal, initial, str(uuid.uuid4()))
+            except ValueError:
+                return None
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(attempt) for _ in range(2)]
+            results = [f.result(timeout=5) for f in futures]
+        winners = [r for r in results if r is not None]
+        self.assertEqual(len(winners), 1)
+        self.assertEqual(read_state(journal), winners[0])
+
+    def test_p06_journal_advance_quarantines_old_broker_and_database(self):
+        journal, initial, tokens = self.recovery_fixture()
+        old = Broker(tokens, Session, lambda: read_state(journal))
+        new = advance(journal, initial, str(uuid.uuid4()))
+        with self.assertRaises(Denied):
+            old.execute(tokens["alice"], "A", "1", "list_items")
+        replacement = Broker(tokens, Session, lambda: read_state(journal))
+        with self.assertRaises(Denied):
+            replacement.execute(tokens["alice"], "A", "1", "list_items")
+        self.admin.query(f"UPDATE auth.epoch SET value='{new.epoch}'::uuid")
+        self.assertEqual(replacement.execute(tokens["alice"], "A", "1", "list_items"), ["A1"])
+        with self.assertRaises(Denied):
+            old.execute(tokens["alice"], "A", "1", "list_items")
+
+    def test_p06_journal_change_during_read_suppresses_result(self):
+        journal, initial, tokens = self.recovery_fixture()
+        class RotateDuringRead(Session):
+            def query(self, sql, state="00000"):
+                rows = super().query(sql, state)
+                if sql.startswith("SELECT value FROM crm.item"):
+                    advance(journal, initial, str(uuid.uuid4()))
+                return rows
+        def factory(role):
+            return RotateDuringRead(role) if role == "proof_a1" else Session(role)
+        broker = Broker(tokens, factory, lambda: read_state(journal))
+        with self.assertRaises(Denied):
+            broker.execute(tokens["alice"], "A", "1", "list_items")
+        self.assertEqual(read_state(journal).sequence, 2)
 
     def test_p05_cancel_active_statement_and_discard_session(self):
         scoped = self.open("proof_a1")
@@ -612,7 +705,7 @@ def main():
         print("Server:", with_version.stdout.strip(), "merge SHA:", os.environ.get("GITHUB_SHA", "local"),
               "PR head:", os.environ.get("PROOF_PR_HEAD", "local"), flush=True)
         result = unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromTestCase(Boundary))
-        if not result.wasSuccessful() or result.skipped or result.testsRun != 33:
+        if not result.wasSuccessful() or result.skipped or result.testsRun != 39:
             raise SystemExit(1)
     finally:
         subprocess.run(["docker","rm","-f",NAME],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)

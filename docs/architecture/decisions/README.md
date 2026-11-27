@@ -15,6 +15,7 @@ This register contains decisions required before Gate 0.2. These are proposals, 
 | 0006 | AI provider independence | Provider adapters, permission filtering, customer-authorised egress | Proposed |
 | 0007 | Deployment | Customer-controlled Docker deployment baseline | Proposed |
 | 0008 | CI and security | Required tests, scans and release gates | Proposed |
+| 0009 | Transaction registry and recovery | Trusted broker, scoped roles, external recovery journal experiment | Proposed |
 
 ## Approval rules
 1. Review each ADR with engineering and security owners.

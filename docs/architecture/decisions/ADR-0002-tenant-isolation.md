@@ -13,6 +13,8 @@ Establish authenticated, database-verified transaction-bound context before prot
 
 The normal runtime database role must not own protected tables and must not have BYPASSRLS. Schema-owner/migration credentials must be separate and unavailable to application runtime.
 
+Candidate mechanism: ADR-0009 documents the implemented experimental transaction registry, dedicated scope roles and recovery authority. The earlier HMAC proposal is not the active proof mechanism. ADR-0009 remains proposed and does not approve a production deployment.
+
 ## Alternatives
 - Application-level filters only: rejected.
 - Separate database per tenant: may be offered for selected deployments but does not replace safe shared-deployment boundaries.

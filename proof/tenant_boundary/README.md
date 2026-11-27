@@ -21,3 +21,6 @@ Parent 80dc1626fe55a3406963e250ae3eec927798b753; verified Run #11 (45955998900):
 
 ## Gate 0.1.9.3 — Recovery experiment
 Parent fbc5bea567107c748be518c37c830b251382ae18; Run #12 verified 26/26 (38.474s), merge SHA 7aebc77ae6850b11c417e9a6f73967c76678055e. Current suite expects 33 tests. See docs/security/GATE_0_1_9_3_RECOVERY_ASSESSMENT.md for scope and limitations. Broker constructor now requires independently supplied expected epoch; test operator obtains it from known-good DB state only for disposable proof. Production must source it from independently protected recovery authority; never blindly adopt a restored DB epoch. Actual logical backup/restore covers selected authority data only, not full cluster restore. No claims of durable anti-rollback, full noninterference or production readiness.
+
+## Gate 0.1.9.4 — Persistent recovery journal
+Verified parent Run #13: 33/33, 46.861s. Current suite expects 39 tests. SQLite recovery journal outside PostgreSQL container persists sequence/epoch and supports explicit operator compare-and-append. Broker reads it at startup and during operations; no auto-adoption from DB. Private directory and trusted operator assumed; not WORM or proof against restoring the journal itself. See ADR-0009 and Gate 0.1.9.4 assessment. Synthetic tests only.

@@ -3,6 +3,8 @@ import hmac
 import re
 from types import MappingProxyType
 
+from recovery_state import RecoveryState
+
 _SCOPE_ROLE = MappingProxyType({
     ("A", "1"): "proof_a1", ("A", "2"): "proof_a2",
     ("B", "1"): "proof_b1", ("B", "2"): "proof_b2",
@@ -19,7 +21,7 @@ class Denied(Exception):
 
 
 class Broker:
-    def __init__(self, credentials, session_factory, expected_epoch):
+    def __init__(self, credentials, session_factory, recovery_reader):
         # Only trusted bootstrap injects credentials and connection factory.
         if set(credentials) != set(_ACTORS):
             raise ValueError("invalid actor registry")
@@ -27,11 +29,27 @@ class Broker:
                for v in credentials.values()) or len(set(credentials.values())) != len(_ACTORS):
             raise ValueError("invalid credential material")
         self._credentials = MappingProxyType(dict(credentials))
-        if not isinstance(expected_epoch, str) or not re.fullmatch(
-                r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', expected_epoch):
-            raise ValueError("invalid expected epoch")
-        self._expected_epoch = expected_epoch
+        if not callable(recovery_reader):
+            raise ValueError("missing trusted recovery reader")
+        self._recovery_reader = recovery_reader
+        try:
+            self._expected_state = self._read_recovery()
+        except Exception:
+            raise Denied("denied") from None
+        self._expected_epoch = self._expected_state.epoch
         self._session_factory = session_factory
+
+    def _read_recovery(self):
+        state = self._recovery_reader()
+        if (not isinstance(state, RecoveryState) or type(state.sequence) is not int
+                or state.sequence < 1 or not isinstance(state.epoch, str)
+                or not re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", state.epoch)):
+            raise Denied("denied")
+        return state
+
+    def _require_recovery(self):
+        if self._read_recovery() != self._expected_state:
+            raise Denied("denied")
 
     def _authenticate(self, token):
         if not isinstance(token, str) or not re.fullmatch(r"[0-9a-f]{64}", token):
@@ -53,6 +71,7 @@ class Broker:
             raise Denied("denied")
         runtime = issuer = None
         try:
+            self._require_recovery()
             runtime = self._session_factory(role)
             runtime.query("BEGIN ISOLATION LEVEL READ COMMITTED")
             result = runtime.query("SELECT pg_backend_pid(),pg_current_xact_id()")
@@ -71,7 +90,9 @@ class Broker:
                 raise Denied("denied")
             if runtime.query(f"SELECT auth.allowed('{tenant}','{bu}')") != ["t"]:
                 raise Denied("denied")
+            self._require_recovery()
             runtime.query("COMMIT")
+            self._require_recovery()
             return rows
         except Exception:
             raise Denied("denied") from None
