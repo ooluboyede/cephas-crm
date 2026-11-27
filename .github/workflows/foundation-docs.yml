@@ -52,6 +52,7 @@ jobs:
             "docs/licensing/GATE_0_1_7_LICENCE_PROTOCOL.md"
             "docs/architecture/GATE_0_1_7_PLATFORM_BLUEPRINT.md"
             "docs/engineering/GATE_0_1_7_CLOSURE_AND_REVIEW.md"
+            "docs/security/GATE_0_1_8_BOUNDARY_PROOF_PLAN.md"
           )
           for file in "${required_files[@]}"; do
             git ls-files --error-unmatch -- "$file" >/dev/null

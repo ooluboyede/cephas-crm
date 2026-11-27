@@ -24,13 +24,13 @@ Signed payload defines licence schema/version and unique ID; product identifier 
 6. Verify not-before and expiry using defined clock policy.
 7. Enforce limits and feature entitlements server-side.
 8. Record minimal tamper-evident validation event without logging sensitive licence material.
-9. Fail closed for invalid signatures, unsupported schemas, mismatched product/tenant/deployment or expired licences, subject to an explicitly documented renewal/grace policy.
+9. Fail closed for invalid signatures, unsupported schemas, mismatched product/tenant/deployment or expired licences, with no silent grace in the proposed initial profile; recovery/export is separately authorised and audited, preserves data and never bypasses tenant isolation.
 
 ## 5. Cryptographic design
 Use a modern supported digital signature scheme such as Ed25519, subject to library review and platform support. Define deterministic serialization/canonicalization and test cross-language verification. Do not invent cryptographic primitives. Key rotation supports overlapping trusted public keys and documented migration.
 
 ## 6. Offline limitations and policy decisions
-Offline deployments cannot receive instantaneous revocation updates. Document renewal, grace period, clock rollback detection, backup/restore, deployment re-binding and emergency key rotation. Avoid destructive lockout on transient clock anomalies; define a risk-based auditable policy. Do not rely solely on a resettable local timestamp file for anti-rollback.
+Offline deployments cannot receive instantaneous revocation updates. Document renewal, explicit no-silent-grace policy, clock rollback detection, backup/restore, deployment re-binding and emergency key rotation. Exact tolerance and protected state remain open. Avoid destructive lockout on transient clock anomalies; define a risk-based auditable policy. Do not rely solely on a resettable local timestamp file for anti-rollback.
 
 ## 7. Security requirements
 - Signing private keys never enter repository, build artifacts or customer packages.

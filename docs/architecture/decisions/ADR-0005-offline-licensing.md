@@ -20,7 +20,7 @@ Specify canonicalisation and encoding. Key rotation must support trusted overlap
 
 ## Consequences and limitations
 - Offline systems cannot receive instantaneous revocation updates. Define signed denylist updates for periodically connected customers, expiry and renewal rules.
-- Define clock rollback detection, grace periods, disaster recovery and deployment rebinding before implementation.
+- Proposed initial policy: no silent grace. Expired or suspect licence/time/trust state denies protected operations without deleting customer data; separately authorised, audited recovery/export remains subject to tenant isolation. Finalise durable clock rollback detection, recovery and deployment rebinding before implementation.
 - Licence validation must not collect customer CRM data.
 - Enforcement is server-side, not merely in the UI.
 
