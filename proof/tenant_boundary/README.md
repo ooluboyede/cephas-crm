@@ -36,3 +36,5 @@ Gate 0.1.13.1 adds signed receipt verification, live floor, cooperative authorit
 Gate 0.1.13.2 adds a separately retained persistent receipt witness, explicit resume and cooperative actor read fencing (66 PostgreSQL tests expected). See docs/security/GATE_0_1_13_2_PERSISTENT_RECEIPT_FLOOR.md for limitations; no production authority custody claimed.
 
 Gate 0.1.13.3 retains signed receipts in witness CAS and adds explicit one-step quarantine recovery plus a standalone rotation certificate verifier (70 PostgreSQL tests expected). See docs/security/GATE_0_1_13_3_DURABLE_RECEIPT_RECOVERY.md. No production rotation or independent custody.
+
+Gate 0.1.14 adds RS256 OIDC ID-token verification and synthetic server session integration with the cooperative actor fence (76 PostgreSQL tests expected). See docs/security/GATE_0_1_14_IDENTITY_AND_LICENSING_BOUNDARY.md; no live IdP or authorization code flow claimed.

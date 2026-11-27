@@ -13,6 +13,8 @@ from pathlib import Path
 
 from broker import Broker, Denied
 from actor_broker import ActorBroker
+from oidc_boundary import OIDCVerifier, SessionGate
+from oidc_fixture import TestIdP
 from independent_authority import R2Proof, AuthorityDenied
 from recovery_state import RecoveryState, initialize, advance, read_state
 
@@ -609,6 +611,108 @@ class Boundary(unittest.TestCase):
             # Ordinary receipt signatures cannot authorize rotation.
             with self.assertRaises(Exception):
                 verify_rotation(raw,r.signer.sign(raw),new,r.public,replacement.public,r.deployment,1,floor)
+
+    def oidc_fixture(self):
+        r=self.r2_fixture()
+        now=[1800000000]
+        idp=TestIdP(r.local.parent,"key1")
+        issuer="https://idp.example.invalid/realms/proof"
+        verifier=OIDCVerifier(issuer,"cephas-crm-proof",lambda:now[0])
+        verifier.install_keys(1,{"keys":[idp.jwk]},60)
+        principals={(issuer,"subject-alice"):"alice",(issuer,"subject-charlie"):"charlie",
+                    (issuer,"subject-bob"):"bob"}
+        tokens={a:secrets.token_hex(32) for a in ("alice","charlie","bob")}
+        gate=SessionGate(verifier,principals,tokens,r,Session)
+        def claims(nonce,**changes):
+            value={"iss":issuer,"aud":"cephas-crm-proof","sub":"subject-alice",
+                   "nonce":nonce,"iat":now[0],"exp":now[0]+120,"auth_time":now[0],
+                   "acr":"urn:cephas:proof:mfa"}
+            value.update(changes)
+            return value
+        return r,now,idp,verifier,gate,claims
+
+    def test_f05_signed_identity_maps_immutable_subject_and_fenced_scope(self):
+        r,now,idp,verifier,gate,claims=self.oidc_fixture()
+        state,nonce=gate.begin()
+        session=gate.complete(state,idp.token(claims(nonce,email="bob@example.invalid",
+                                                    tenant="B",role="admin")))
+        self.assertEqual(gate.execute(session,"A","1","list_items"),["A1"])
+        with self.assertRaises(Denied):
+            gate.execute(session,"B","1","list_items")
+        gate.logout(session)
+        with self.assertRaises(Denied):
+            gate.execute(session,"A","1","list_items")
+
+    def test_f05_invalid_issuer_audience_nonce_time_and_subject_rejected(self):
+        r,now,idp,verifier,gate,claims=self.oidc_fixture()
+        for change in ({"iss":"https://foreign.invalid"},{"aud":"wrong"},{"azp":"wrong"},
+                       {"nonce":"wrong"},{"exp":now[0]},{"iat":now[0]+1},
+                       {"nbf":now[0]+1},{"sub":"unregistered"}):
+            state,nonce=gate.begin()
+            with self.assertRaises(Denied):
+                gate.complete(state,idp.token(claims(nonce,**change)))
+            with self.assertRaises(Denied):
+                gate.complete(state,idp.token(claims(nonce)))
+
+    def test_f05_invalid_signature_algorithm_and_token_key_rejected(self):
+        r,now,idp,verifier,gate,claims=self.oidc_fixture()
+        for header in ({"alg":"none","kid":"key1"},{"alg":"HS256","kid":"key1"},
+                       {"alg":"RS256","kid":"unknown"},{"alg":"RS256","kid":"key1","jku":"https://foreign.invalid"}):
+            state,nonce=gate.begin()
+            with self.assertRaises(Denied):
+                gate.complete(state,idp.token(claims(nonce),header))
+        state,nonce=gate.begin()
+        token=idp.token(claims(nonce))
+        parts=token.split(".")
+        parts[2]=("A" if parts[2][0]!="A" else "B")+parts[2][1:]
+        with self.assertRaises(Denied):
+            gate.complete(state,".".join(parts))
+
+    def test_f05_key_rotation_stale_cache_and_clock_rollback_denied(self):
+        r,now,idp,verifier,gate,claims=self.oidc_fixture()
+        state,nonce=gate.begin()
+        old=gate.complete(state,idp.token(claims(nonce)))
+        new=TestIdP(r.local.parent,"key2")
+        verifier.install_keys(2,{"keys":[new.jwk]},60)
+        with self.assertRaises(Denied):
+            gate.execute(old,"A","1","list_items")
+        with self.assertRaises(Denied):
+            verifier.install_keys(2,{"keys":[idp.jwk]},60)
+        state,nonce=gate.begin()
+        current=gate.complete(state,new.token(claims(nonce)))
+        self.assertEqual(gate.execute(current,"A","1","list_items"),["A1"])
+        now[0]+=60
+        with self.assertRaises(Denied):
+            gate.execute(current,"A","1","list_items")
+        now[0]-=1
+        with self.assertRaises(Denied):
+            verifier.install_keys(3,{"keys":[new.jwk]},60)
+
+    def test_f05_mfa_and_one_time_callback_state(self):
+        r,now,idp,verifier,gate,claims=self.oidc_fixture()
+        state,nonce=gate.begin()
+        token=idp.token(claims(nonce,acr="urn:cephas:proof:password"))
+        session=gate.complete(state,token)
+        with self.assertRaises(Denied):
+            gate.complete(state,token)
+        self.assertEqual(gate.execute(session,"A","1","list_items"),["A1"])
+        with self.assertRaises(Denied):
+            gate.execute(session,"A","1","list_notes")
+
+    def test_f05_membership_revocation_blocks_existing_session_and_quarantine(self):
+        r,now,idp,verifier,gate,claims=self.oidc_fixture()
+        state,nonce=gate.begin()
+        session=gate.complete(state,idp.token(claims(nonce)))
+        self.assertEqual(gate.execute(session,"A","1","list_notes"),["note-A1"])
+        self.admin.query("UPDATE auth.membership SET active=false,revision=revision+1 WHERE principal='alice' AND tenant='A' AND bu='1'")
+        try:
+            with self.assertRaises(Denied):
+                gate.execute(session,"A","1","list_items")
+        finally:
+            self.admin.query("UPDATE auth.membership SET active=true,revision=revision+1 WHERE principal='alice' AND tenant='A' AND bu='1'")
+        r.quarantine()
+        with self.assertRaises(Denied):
+            gate.execute(session,"A","1","list_items")
 
     def recovery_fixture(self):
         directory = tempfile.TemporaryDirectory()
@@ -1214,7 +1318,7 @@ def main():
         print("Server:", with_version.stdout.strip(), "merge SHA:", os.environ.get("GITHUB_SHA", "local"),
               "PR head:", os.environ.get("PROOF_PR_HEAD", "local"), flush=True)
         result = unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromTestCase(Boundary))
-        if not result.wasSuccessful() or result.skipped or result.testsRun != 70:
+        if not result.wasSuccessful() or result.skipped or result.testsRun != 76:
             raise SystemExit(1)
     finally:
         for container in (NAME, AUTHORITY_NAME):
