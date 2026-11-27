@@ -70,6 +70,7 @@ jobs:
             "docs/engineering/GATE_0_1_11_CONSOLIDATED_ACCEPTANCE.md"
             "docs/engineering/GATE_0_1_11_OWNER_DECISION_REGISTER.md"
             "docs/engineering/GATE_0_1_11_INDEPENDENT_REVIEW_BRIEF.md"
+            "docs/engineering/GATE_0_1_11_1_GOVERNANCE_AND_DESIGN_CLEARANCE.md"
           )
           for file in "${required_files[@]}"; do
             git ls-files --error-unmatch -- "$file" >/dev/null

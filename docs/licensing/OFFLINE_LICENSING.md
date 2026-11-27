@@ -13,21 +13,21 @@ Allow a customer-controlled installation to validate its annual licence locally 
 - A valid signature proves trusted issuance, not that a licence is current or applicable to this installation.
 
 ## 3. Licence claims
-Signed payload defines licence schema/version and unique ID; product identifier CEPHAS_CRM; customer/organisation and tenant IDs; edition and enabled module IDs; deployment/environment binding policy and deployment ID where used; issue, not-before and expiry times; approved user/seat/record/transaction limits; signing key ID (kid) and algorithm; optional renewal/support metadata. Avoid secrets and unnecessary personal data.
+The sole proposed production format is the existing universal issuer v1.0 envelope {payload, signature, algorithm}. Payload contains schemaVersion, licenseId, customer, product, tier, deployment, issuedAt, expiresAt, gracePeriodDays, limits, modules, features and keyVersion. Product code CEPHAS_CRM; customer code and deployment ID/environment are bound. Quotas are users, transactions, apiCalls, sites and businessUnits. No signed tenant UUID, record limit or separate not-before field exists in v1.0. Local tenant/BU authorization is independently enforced. Do not extend signed claims without central issuer approval.
 
 ## 4. Validation sequence
 1. Parse using a strict versioned schema.
 2. Reject unknown/disallowed algorithms and malformed encodings.
-3. Select trusted public key by kid.
-4. Verify signature over exact canonical payload bytes.
-5. Verify product, tenant, edition, modules and deployment binding.
-6. Verify not-before and expiry using defined clock policy.
+3. Select independently provisioned trusted public key by keyVersion and confirm fingerprint/status.
+4. Verify Ed25519 signature over exact UTF-8 JSON.stringify(payload), with no sorted-key or domain-prefix fallback.
+5. Verify customer, product, tier, modules/features and deployment/environment; independently enforce local tenant/BU membership.
+6. Verify issuedAt and expiresAt, signed grace bounded by approved local policy, protected time and locally available revocation.
 7. Enforce limits and feature entitlements server-side.
 8. Record minimal tamper-evident validation event without logging sensitive licence material.
 9. Fail closed for invalid signatures, unsupported schemas, mismatched product/tenant/deployment or expired licences, with no silent grace in the proposed initial profile; recovery/export is separately authorised and audited, preserves data and never bypasses tenant isolation.
 
 ## 5. Cryptographic design
-Use a modern supported digital signature scheme such as Ed25519, subject to library review and platform support. Define deterministic serialization/canonicalization and test cross-language verification. Do not invent cryptographic primitives. Key rotation supports overlapping trusted public keys and documented migration.
+Use issuer-standard Ed25519 with exact ECMAScript serialization. Verify the compact exported artifact, reject duplicate/ambiguous fields and untrusted embedded keys. Test independent issuer-signed fixtures. Node prototype is not an approved production backend. Do not invent cryptographic primitives. Key rotation supports overlapping trusted public keys and documented migration.
 
 ## 6. Offline limitations and policy decisions
 Offline deployments cannot receive instantaneous revocation updates. Document renewal, explicit no-silent-grace policy, clock rollback detection, backup/restore, deployment re-binding and emergency key rotation. Exact tolerance and protected state remain open. Avoid destructive lockout on transient clock anomalies; define a risk-based auditable policy. Do not rely solely on a resettable local timestamp file for anti-rollback.
@@ -42,3 +42,6 @@ Offline deployments cannot receive instantaneous revocation updates. Document re
 
 ## 8. Required artefacts before implementation
 Licence schema; canonicalization specification; signing/verification library decision; public-key trust-store format; key ceremony and rotation procedure; clock/grace policy; test vectors; threat model; renewal/recovery runbook.
+
+## Protocol reconciliation
+The earlier Gate 0.1.7 candidate protocol remains historical experimental evidence, not a supported alternative licence format. Current authoritative source inspection and limitations are documented in Gates 0.1.10.1–0.1.10.4. Commercial policy, genuine fixture, signed renewal ordering, complete revocation, protected state and customer-side enforcement remain pending. No final approval implied.
