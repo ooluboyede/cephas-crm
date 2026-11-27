@@ -5,8 +5,12 @@ CREATE ROLE proof_data_owner NOLOGIN NOSUPERUSER NOBYPASSRLS;
 CREATE ROLE proof_runtime LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEROLE NOCREATEDB NOREPLICATION PASSWORD :'runtime_pw';
 CREATE ROLE proof_issuer_a LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEROLE NOCREATEDB NOREPLICATION PASSWORD :'issuer_a_pw';
 CREATE ROLE proof_issuer_b LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEROLE NOCREATEDB NOREPLICATION PASSWORD :'issuer_b_pw';
+CREATE ROLE proof_a1 LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEROLE NOCREATEDB NOREPLICATION PASSWORD :'proof_a1_pw';
+CREATE ROLE proof_a2 LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEROLE NOCREATEDB NOREPLICATION PASSWORD :'proof_a2_pw';
+CREATE ROLE proof_b1 LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEROLE NOCREATEDB NOREPLICATION PASSWORD :'proof_b1_pw';
+CREATE ROLE proof_b2 LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEROLE NOCREATEDB NOREPLICATION PASSWORD :'proof_b2_pw';
 REVOKE ALL ON DATABASE postgres FROM PUBLIC;
-GRANT CONNECT ON DATABASE postgres TO proof_runtime, proof_issuer_a, proof_issuer_b;
+GRANT CONNECT ON DATABASE postgres TO proof_runtime, proof_issuer_a, proof_issuer_b, proof_a1, proof_a2, proof_b1, proof_b2;
 REVOKE ALL ON SCHEMA public FROM PUBLIC;
 -- Same-login sessions can otherwise observe one another's SQL text.
 REVOKE SELECT ON pg_catalog.pg_stat_activity FROM PUBLIC;
@@ -41,6 +45,12 @@ CREATE TABLE auth.membership (
 INSERT INTO auth.membership VALUES
  ('alice','A','1',1,true),('alice','A','2',1,true),
  ('bob','B','1',1,true),('bob','B','2',1,true);
+-- Legacy shared login retained exclusively for regression comparison.
+CREATE TABLE auth.scope_login (
+ login name PRIMARY KEY, tenant text NOT NULL, bu text NOT NULL, UNIQUE(tenant,bu)
+);
+INSERT INTO auth.scope_login VALUES ('proof_a1','A','1'),('proof_a2','A','2'),
+ ('proof_b1','B','1'),('proof_b2','B','2');
 CREATE TABLE auth.binding (
  epoch uuid NOT NULL, boot timestamptz NOT NULL, pid integer NOT NULL,
  backend_start timestamptz NOT NULL,
@@ -55,7 +65,7 @@ CREATE TABLE auth.binding (
 CREATE FUNCTION auth.issue(target_pid integer, target_xid xid8, requested_tenant text, requested_bu text)
 RETURNS void LANGUAGE plpgsql SECURITY DEFINER
 SET search_path=pg_catalog,pg_temp AS $body$
-DECLARE actor text; rev bigint; deployment_epoch uuid; target_start timestamptz;
+DECLARE actor text; rev bigint; deployment_epoch uuid; target_start timestamptz; target_login name;
 BEGIN
  IF target_pid IS NULL OR target_pid<=0 OR target_xid IS NULL THEN
    RAISE EXCEPTION 'invalid binding' USING ERRCODE='42501';
@@ -66,8 +76,9 @@ BEGIN
  IF NOT FOUND THEN RAISE EXCEPTION 'scope denied' USING ERRCODE='42501'; END IF;
  -- PostgreSQL exposes the low 32-bit live XID in activity; the verifier also
  -- requires exact xid8 in the target session. This is not client authentication.
- SELECT a.backend_start INTO target_start FROM pg_catalog.pg_stat_activity a
- WHERE a.pid=target_pid AND a.usename='proof_runtime'
+ SELECT a.backend_start,a.usename INTO target_start,target_login FROM pg_catalog.pg_stat_activity a
+ WHERE a.pid=target_pid AND (a.usename='proof_runtime' OR EXISTS (
+  SELECT 1 FROM auth.scope_login s WHERE s.login=a.usename AND s.tenant=requested_tenant AND s.bu=requested_bu))
    AND a.datname=pg_catalog.current_database()
    AND a.backend_type='client backend' AND a.state='idle in transaction'
    AND a.backend_xid::text::numeric=pg_catalog.mod(target_xid::text::numeric,4294967296::numeric);
@@ -75,13 +86,14 @@ BEGIN
  SELECT e.value INTO STRICT deployment_epoch FROM auth.epoch e WHERE e.singleton;
  INSERT INTO auth.binding(epoch,boot,pid,backend_start,xid,login,principal,tenant,bu,revision,expires)
  VALUES(deployment_epoch,pg_catalog.pg_postmaster_start_time(),target_pid,target_start,target_xid,
-        'proof_runtime',actor,requested_tenant,requested_bu,rev,pg_catalog.clock_timestamp()+interval '30 seconds');
+        target_login,actor,requested_tenant,requested_bu,rev,pg_catalog.clock_timestamp()+interval '30 seconds');
 END
 $body$;
 CREATE FUNCTION auth.allowed(requested_tenant text, requested_bu text)
 RETURNS boolean LANGUAGE sql STABLE SECURITY DEFINER
 SET search_path=pg_catalog,pg_temp AS $body$
- SELECT session_user='proof_runtime'
+ SELECT (session_user='proof_runtime' OR EXISTS (
+  SELECT 1 FROM auth.scope_login s WHERE s.login=session_user AND s.tenant=requested_tenant AND s.bu=requested_bu))
  AND pg_catalog.current_setting('transaction_isolation')='read committed'
  AND EXISTS(
   SELECT 1 FROM auth.binding b
@@ -98,9 +110,9 @@ SET search_path=pg_catalog,pg_temp AS $body$
 $body$;
 REVOKE ALL ON ALL TABLES IN SCHEMA auth FROM PUBLIC;
 REVOKE ALL ON ALL FUNCTIONS IN SCHEMA auth FROM PUBLIC;
-GRANT USAGE ON SCHEMA auth TO proof_runtime,proof_issuer_a,proof_issuer_b,proof_data_owner;
+GRANT USAGE ON SCHEMA auth TO proof_runtime,proof_issuer_a,proof_issuer_b,proof_data_owner,proof_a1, proof_a2, proof_b1, proof_b2;
 GRANT EXECUTE ON FUNCTION auth.issue(integer,xid8,text,text) TO proof_issuer_a,proof_issuer_b;
-GRANT EXECUTE ON FUNCTION auth.allowed(text,text) TO proof_runtime,proof_data_owner;
+GRANT EXECUTE ON FUNCTION auth.allowed(text,text) TO proof_runtime,proof_data_owner,proof_a1, proof_a2, proof_b1, proof_b2;
 RESET ROLE;
 SET ROLE proof_data_owner;
 CREATE TABLE crm.item(tenant text NOT NULL,bu text NOT NULL,id integer NOT NULL,value text NOT NULL,PRIMARY KEY(tenant,bu,id));
@@ -112,9 +124,9 @@ ALTER TABLE crm.item ENABLE ROW LEVEL SECURITY;
 ALTER TABLE crm.item FORCE ROW LEVEL SECURITY;
 ALTER TABLE crm.note ENABLE ROW LEVEL SECURITY;
 ALTER TABLE crm.note FORCE ROW LEVEL SECURITY;
-CREATE POLICY item_scope ON crm.item TO proof_runtime USING (auth.allowed(tenant,bu)) WITH CHECK (auth.allowed(tenant,bu));
-CREATE POLICY note_scope ON crm.note TO proof_runtime USING (auth.allowed(tenant,bu)) WITH CHECK (auth.allowed(tenant,bu));
-GRANT USAGE ON SCHEMA crm TO proof_runtime;
-GRANT SELECT,INSERT,DELETE ON crm.item,crm.note TO proof_runtime;
-GRANT UPDATE(value) ON crm.item,crm.note TO proof_runtime;
+CREATE POLICY item_scope ON crm.item TO proof_runtime, proof_a1, proof_a2, proof_b1, proof_b2 USING (auth.allowed(tenant,bu)) WITH CHECK (auth.allowed(tenant,bu));
+CREATE POLICY note_scope ON crm.note TO proof_runtime, proof_a1, proof_a2, proof_b1, proof_b2 USING (auth.allowed(tenant,bu)) WITH CHECK (auth.allowed(tenant,bu));
+GRANT USAGE ON SCHEMA crm TO proof_runtime, proof_a1, proof_a2, proof_b1, proof_b2;
+GRANT SELECT,INSERT,DELETE ON crm.item,crm.note TO proof_runtime, proof_a1, proof_a2, proof_b1, proof_b2;
+GRANT UPDATE(value) ON crm.item,crm.note TO proof_runtime, proof_a1, proof_a2, proof_b1, proof_b2;
 RESET ROLE;

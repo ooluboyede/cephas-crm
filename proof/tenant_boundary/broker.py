@@ -1,0 +1,76 @@
+"""Synthetic trusted broker experiment; not a production authentication service."""
+import hmac
+import re
+from types import MappingProxyType
+
+_SCOPE_ROLE = MappingProxyType({
+    ("A", "1"): "proof_a1", ("A", "2"): "proof_a2",
+    ("B", "1"): "proof_b1", ("B", "2"): "proof_b2",
+})
+_ACTORS = MappingProxyType({"alice": "proof_issuer_a", "bob": "proof_issuer_b"})
+_OPERATIONS = MappingProxyType({
+    "list_items": "SELECT value FROM crm.item ORDER BY id",
+    "list_notes": "SELECT value FROM crm.note ORDER BY id",
+})
+
+
+class Denied(Exception):
+    """Generic denial; never return raw database errors or credentials."""
+
+
+class Broker:
+    def __init__(self, credentials, session_factory):
+        # Only trusted bootstrap injects credentials and connection factory.
+        if set(credentials) != set(_ACTORS):
+            raise ValueError("invalid actor registry")
+        if any(not isinstance(v, str) or not re.fullmatch(r"[0-9a-f]{64}", v)
+               for v in credentials.values()) or len(set(credentials.values())) != len(_ACTORS):
+            raise ValueError("invalid credential material")
+        self._credentials = MappingProxyType(dict(credentials))
+        self._session_factory = session_factory
+
+    def _authenticate(self, token):
+        if not isinstance(token, str) or not re.fullmatch(r"[0-9a-f]{64}", token):
+            raise Denied("denied")
+        matches = [actor for actor, secret in self._credentials.items()
+                   if hmac.compare_digest(token, secret)]
+        if len(matches) != 1:
+            raise Denied("denied")
+        return matches[0]
+
+    def execute(self, token, tenant, bu, operation):
+        # No caller-provided actor, SQL, connection, target PID/XID, role or callback.
+        actor = self._authenticate(token)
+        if any(type(v) is not str for v in (tenant, bu, operation)):
+            raise Denied("denied")
+        role = _SCOPE_ROLE.get((tenant, bu))
+        query = _OPERATIONS.get(operation)
+        if role is None or query is None:
+            raise Denied("denied")
+        runtime = issuer = None
+        try:
+            runtime = self._session_factory(role)
+            runtime.query("BEGIN ISOLATION LEVEL READ COMMITTED")
+            result = runtime.query("SELECT pg_backend_pid(),pg_current_xact_id()")
+            if len(result) != 1 or not re.fullmatch(r"[0-9]+\|[0-9]+", result[0]):
+                raise Denied("denied")
+            pid, xid = result[0].split("|")
+            issuer = self._session_factory(_ACTORS[actor])
+            # Scope literals originate exclusively from the fixed allowlist above.
+            issuer.query(f"SELECT auth.issue({pid},'{xid}'::xid8,'{tenant}','{bu}')")
+            if runtime.query(f"SELECT auth.allowed('{tenant}','{bu}')") != ["t"]:
+                raise Denied("denied")
+            rows = runtime.query(query)
+            runtime.query("COMMIT")
+            return rows
+        except Exception:
+            raise Denied("denied") from None
+        finally:
+            # No pooling and no connection exposed to the caller. Closing even on
+            # failure is essential; cleanup failure prevents returning data.
+            try:
+                if issuer is not None:
+                    issuer.close()
+            finally:
+                if runtime is not None:
+                    runtime.close()

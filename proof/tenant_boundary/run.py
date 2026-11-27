@@ -7,10 +7,13 @@ import time
 import unittest
 from pathlib import Path
 
+from broker import Broker, Denied
+
 ROOT = Path(__file__).resolve().parent
 NAME = "cephas-proof-" + secrets.token_hex(6)
 PASSWORDS = {role: secrets.token_hex(24) for role in
-             ("postgres", "proof_runtime", "proof_issuer_a", "proof_issuer_b")}
+             ("postgres", "proof_runtime", "proof_issuer_a", "proof_issuer_b",
+              "proof_a1", "proof_a2", "proof_b1", "proof_b2")}
 PINNED_IMAGE = "postgres@sha256:64c8b0d31e4ab6ea665e8426ea406a94bf52de3c05b3a4a8bf713704eefa9328"
 IMAGE = os.environ.get("PROOF_POSTGRES_IMAGE", PINNED_IMAGE)
 if IMAGE != PINNED_IMAGE:
@@ -104,6 +107,94 @@ class Boundary(unittest.TestCase):
 
     def values(self, s=None):
         return (s or self.a).query("SELECT value FROM crm.item ORDER BY tenant,bu,id")
+
+    def broker(self, factory=Session):
+        tokens = {actor: secrets.token_hex(32) for actor in ("alice", "bob")}
+        return Broker(tokens, factory), tokens
+
+    def test_p08_broker_authenticates_and_binds_fresh_sessions(self):
+        broker, tokens = self.broker()
+        self.assertEqual(broker.execute(tokens["alice"], "A", "1", "list_items"), ["A1"])
+        self.assertEqual(broker.execute(tokens["alice"], "A", "2", "list_notes"), ["note-A2"])
+        self.assertEqual(broker.execute(tokens["bob"], "B", "1", "list_items"), ["B1"])
+        self.assertEqual(broker.execute(tokens["bob"], "B", "2", "list_items"), ["B2"])
+
+    def test_p08_broker_denies_bad_credentials_scope_and_operation(self):
+        broker, tokens = self.broker()
+        for token, tenant, bu, op in (
+            ("invalid", "A", "1", "list_items"),
+            (secrets.token_hex(32), "A", "1", "list_items"),
+            (tokens["alice"], "B", "1", "list_items"),
+            (tokens["bob"], "A", "2", "list_items"),
+            (tokens["alice"], "A", "*", "list_items"),
+            (tokens["alice"], "A", "1", "SELECT * FROM auth.binding"),
+            (tokens["alice"], "A", "1", ["list_items"]),
+        ):
+            with self.assertRaisesRegex(Denied, "^denied$"):
+                broker.execute(token, tenant, bu, op)
+        self.assertEqual(broker.execute(tokens["alice"], "A", "1", "list_items"), ["A1"])
+
+    def test_p08_broker_rejects_caller_target_injection(self):
+        broker, tokens = self.broker()
+        for extra in ({"actor": "bob"}, {"target_pid": 1}, {"target_xid": "42"},
+                      {"role": "postgres"}, {"sql": "SELECT 1"}, {"connection": self.a}):
+            with self.assertRaises(TypeError):
+                broker.execute(tokens["alice"], "A", "1", "list_items", **extra)
+
+    def test_p08_broker_revoked_membership_denied(self):
+        broker, tokens = self.broker()
+        try:
+            self.admin.query("UPDATE auth.membership SET active=false,revision=revision+1 WHERE principal='alice' AND tenant='A' AND bu='1'")
+            with self.assertRaises(Denied):
+                broker.execute(tokens["alice"], "A", "1", "list_items")
+            self.assertEqual(broker.execute(tokens["alice"], "A", "2", "list_items"), ["A2"])
+        finally:
+            self.admin.query("UPDATE auth.membership SET active=true,revision=revision+1 WHERE principal='alice' AND tenant='A' AND bu='1'")
+
+    def test_p08_broker_disposes_connections_on_success_and_failure(self):
+        opened = []
+        def factory(role):
+            session = Session(role)
+            opened.append(session)
+            return session
+        broker, tokens = self.broker(factory)
+        self.assertEqual(broker.execute(tokens["alice"], "A", "1", "list_items"), ["A1"])
+        with self.assertRaises(Denied):
+            broker.execute(tokens["alice"], "B", "1", "list_items")
+        self.assertEqual(len(opened), 4)
+        self.assertTrue(all(s.p.poll() is not None for s in opened))
+
+    def test_p04_scope_login_rejects_foreign_issuance_and_role_switch(self):
+        scoped = self.open("proof_a1")
+        binding = self.begin(scoped)
+        self.issue(binding, tenant="B", issuer=self.ib, state="42501")
+        self.issue(binding, bu="2", state="42501")
+        self.assertEqual(self.values(scoped), [])
+        self.issue(binding)
+        self.assertEqual(self.values(scoped), ["A1"])
+        scoped.query("SAVEPOINT denied")
+        scoped.query("SET ROLE proof_b1", "42501")
+        scoped.query("ROLLBACK TO denied")
+        scoped.query("SET SESSION AUTHORIZATION proof_b1", "42501")
+        scoped.query("ROLLBACK TO denied")
+        scoped.query("INSERT INTO crm.item VALUES ('B','1',9,'bad')", "42501")
+        scoped.query("ROLLBACK TO denied")
+        self.assertEqual(self.values(scoped), ["A1"])
+        scoped.query("ROLLBACK")
+
+    def test_p04_scope_login_cannot_mint_context_or_read_authority(self):
+        scoped = self.open("proof_b2")
+        binding = self.begin(scoped)
+        self.issue(binding, tenant="B", bu="2", issuer=self.ib)
+        self.assertEqual(self.values(scoped), ["B2"])
+        scoped.query("SAVEPOINT denied")
+        self.issue(binding, tenant="B", bu="2", issuer=scoped, state="42501")
+        scoped.query("ROLLBACK TO denied")
+        scoped.query("SELECT * FROM auth.scope_login", "42501")
+        scoped.query("ROLLBACK TO denied")
+        scoped.query("SELECT query FROM pg_catalog.pg_stat_activity", "42501")
+        scoped.query("ROLLBACK")
+        self.assertEqual(self.values(scoped), [])
 
     def test_p02_live_target_validation(self):
         pid, xid = self.begin()
@@ -372,6 +463,8 @@ def main():
                  "-v","runtime_pw="+PASSWORDS["proof_runtime"],
                  "-v","issuer_a_pw="+PASSWORDS["proof_issuer_a"],
                  "-v","issuer_b_pw="+PASSWORDS["proof_issuer_b"]]
+        for role in ("proof_a1", "proof_a2", "proof_b1", "proof_b2"):
+            args.extend(["-v", role+"_pw="+PASSWORDS[role]])
         setup = subprocess.run(args, input=(ROOT / "bootstrap.sql").read_text(),
                                text=True, capture_output=True)
         if setup.returncode:
@@ -382,7 +475,7 @@ def main():
         print("Server:", with_version.stdout.strip(), "merge SHA:", os.environ.get("GITHUB_SHA", "local"),
               "PR head:", os.environ.get("PROOF_PR_HEAD", "local"), flush=True)
         result = unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromTestCase(Boundary))
-        if not result.wasSuccessful() or result.skipped or result.testsRun != 19:
+        if not result.wasSuccessful() or result.skipped or result.testsRun != 26:
             raise SystemExit(1)
     finally:
         subprocess.run(["docker","rm","-f",NAME],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)

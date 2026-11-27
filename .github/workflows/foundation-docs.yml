@@ -55,6 +55,7 @@ jobs:
             "docs/security/GATE_0_1_8_BOUNDARY_PROOF_PLAN.md"
             "proof/tenant_boundary/README.md"
             "docs/security/GATE_0_1_9_1_INTERNAL_ASSESSMENT.md"
+            "docs/security/GATE_0_1_9_2_BROKER_ASSESSMENT.md"
           )
           for file in "${required_files[@]}"; do
             git ls-files --error-unmatch -- "$file" >/dev/null
@@ -97,7 +98,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Compile proof harness
-        run: python3 -m py_compile proof/tenant_boundary/run.py
+        run: python3 -m py_compile proof/tenant_boundary/run.py proof/tenant_boundary/broker.py
       - name: Run real PostgreSQL proof
         env:
           PROOF_PR_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
