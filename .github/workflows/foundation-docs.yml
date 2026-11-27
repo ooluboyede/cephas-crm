@@ -9,13 +9,21 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: foundation-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   validate-foundation:
     name: Validate foundation artefacts
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
 
       - name: Validate required documents
         shell: bash
@@ -28,11 +36,47 @@ jobs:
             "docs/security/SECURITY_BASELINE.md"
             "docs/licensing/OFFLINE_LICENSING.md"
             "docs/engineering/GATE_0_1_ACCEPTANCE.md"
+            "docs/architecture/decisions/README.md"
+            "docs/architecture/decisions/ADR-0001-modular-monolith.md"
+            "docs/architecture/decisions/ADR-0002-tenant-isolation.md"
+            "docs/architecture/decisions/ADR-0003-identity-access.md"
+            "docs/architecture/decisions/ADR-0004-database-governance.md"
+            "docs/architecture/decisions/ADR-0005-offline-licensing.md"
+            "docs/architecture/decisions/ADR-0006-ai-provider-independence.md"
+            "docs/architecture/decisions/ADR-0007-customer-hosted-deployment.md"
+            "docs/architecture/decisions/ADR-0008-ci-quality-security-gates.md"
+            "docs/engineering/GATE_0_1_3_ARCHITECTURE_ASSURANCE.md"
+            "docs/security/GATE_0_1_4_THREAT_MODEL.md"
+            "docs/security/GATE_0_1_5_TENANT_IDENTITY_BOUNDARY.md"
+            "docs/engineering/GATE_0_1_6_DEPENDENCY_CI_GOVERNANCE.md"
           )
           for file in "${required_files[@]}"; do
-            test -s "$file" || { echo "Missing or empty required file: $file"; exit 1; }
+            git ls-files --error-unmatch -- "$file" >/dev/null
+            test -f "$file" && test ! -L "$file" && test -s "$file" || { echo "Missing, empty or non-regular document: $file"; exit 1; }
+            grep -q '^# ' "$file" || { echo "Missing document title: $file"; exit 1; }
           done
-          echo "All required foundation documents exist and are non-empty."
+          echo "All required foundation and architecture documents validated."
 
-      - name: Check whitespace errors
-        run: git diff --check
+      - name: Check actual change range
+        shell: bash
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_EVENT_NAME" == pull_request ]]; then
+            base="$PR_BASE_SHA"
+            [[ "$PR_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]
+            git cat-file -e "$PR_HEAD_SHA^{commit}"
+            echo "PR head: $PR_HEAD_SHA"
+          else
+            base="$PUSH_BEFORE_SHA"
+          fi
+          [[ "$base" =~ ^[0-9a-f]{40}$ && "$base" != 0000000000000000000000000000000000000000 ]]
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
+          git cat-file -e "$base^{commit}"
+          git cat-file -e "$GITHUB_SHA^{commit}"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          echo "Checking $base -> $GITHUB_SHA"
+          git diff --check "$base" "$GITHUB_SHA" --
