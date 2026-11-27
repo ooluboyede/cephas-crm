@@ -11,3 +11,6 @@ HMAC capability: deferred; cryptographic verifier feasibility unproven. Shared l
 
 ## Acceptance
 Independent review of exact proof SHA and all tests, production trust boundary design, external durable monotonic authority with protected custody, full restore/failover and quarantine, role lifecycle and OIDC integration. No original Gate 0.1 criterion waived. The proof is not a production implementation or release authorisation.
+
+## R1 proposed refinement (Gate 0.1.12.1)
+The candidate actor-specific self-binding proof replaces externally selected PID/XID for its own path. Actor-specific login and fixed broker handler, top-level transaction deadline, pinned session identity and live membership are proposed; legacy target issuer is regression-only. See docs/security/GATE_0_1_12_1_ACTOR_BOUNDARY.md for custody, trust exclusions, strict isolation profile and unimplemented mutation requirements. ADR remains Proposed; no owner or reviewer acceptance.

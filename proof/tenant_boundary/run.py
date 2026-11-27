@@ -206,6 +206,59 @@ class Boundary(unittest.TestCase):
         with self.assertRaises(Denied):
             broker.execute(tokens["alice"],"A","1","list_items")
 
+    def test_f01_same_actor_sessions_do_not_share_binding(self):
+        first = self.open("proof_alice_a1")
+        second = self.open("proof_alice_a1")
+        epoch = self.actor_epoch()
+        self.begin(first)
+        self.begin(second)
+        first.query(f"SELECT auth.bind_self('A','1','{epoch}')")
+        self.assertEqual(self.values(first), ["A1"])
+        self.assertEqual(self.values(second), [])
+        second.query(f"SELECT auth.bind_self('A','1','{epoch}')")
+        first.query("ROLLBACK")
+        self.assertEqual(self.values(second), ["A1"])
+        second.query("ROLLBACK")
+
+    def test_f01_concurrent_actor_broker_requests(self):
+        from threading import Barrier
+        tokens = {a: secrets.token_hex(32) for a in ("alice","charlie","bob")}
+        state = RecoveryState(1,self.actor_epoch())
+        barrier = Barrier(3, timeout=10)
+        broker = ActorBroker(tokens,Session,lambda: state)
+        def call(actor,tenant,operation):
+            barrier.wait()
+            return broker.execute(tokens[actor],tenant,"1",operation)
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            futures = [pool.submit(call,*args) for args in (
+                ("alice","A","list_items"),("charlie","A","list_notes"),("bob","B","list_items"))]
+            self.assertEqual([future.result(timeout=20) for future in futures],
+                             [["A1"],["note-A1"],["B1"]])
+
+    def test_f01_broker_detects_same_role_transaction_replacement(self):
+        tokens = {a: secrets.token_hex(32) for a in ("alice","charlie","bob")}
+        state = RecoveryState(1,self.actor_epoch())
+        class ReplaceAfterRead(Session):
+            def query(self, sql, state_code="00000"):
+                rows = super().query(sql,state_code)
+                if sql.startswith("SELECT value FROM crm.item"):
+                    super().query("ROLLBACK")
+                    super().query("BEGIN ISOLATION LEVEL READ COMMITTED")
+                    super().query(f"SELECT auth.bind_self('A','1','{state.epoch}')")
+                return rows
+        broker = ActorBroker(tokens,ReplaceAfterRead,lambda: state)
+        with self.assertRaises(Denied):
+            broker.execute(tokens["alice"],"A","1","list_items")
+
+    def test_f01_actor_authority_tables_and_legacy_binding_denied(self):
+        actor = self.open("proof_alice_a1")
+        actor.query("SELECT * FROM auth.actor_login", "42501")
+        actor.query("SELECT * FROM auth.binding", "42501")
+        actor.query("UPDATE auth.membership SET active=true", "42501")
+        actor.query("SELECT auth.current_epoch()", "42501")
+        self.ia.query(f"SELECT auth.bind_self('A','1','{self.actor_epoch()}')", "42501")
+        self.a.query(f"SELECT auth.bind_self('A','1','{self.actor_epoch()}')", "42501")
+
     def recovery_fixture(self):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
@@ -722,9 +775,28 @@ class Boundary(unittest.TestCase):
         self.assertEqual(self.values(), [])
         self.issue(self.begin())
         self.assertEqual(self.values(), ["A1"])
+        actor = self.open("proof_alice_a1")
+        late = self.open("proof_charlie_a1")
+        epoch = self.actor_epoch()
+        self.begin(actor)
+        actor.query("SAVEPOINT before_bind")
+        actor.query(f"SELECT auth.bind_self('A','1','{epoch}')")
+        self.assertEqual(self.values(actor), ["A1"])
+        self.begin(late)
+        # Share the existing real expiry wait across all three transactions.
         time.sleep(31)
         self.assertEqual(self.values(), [])
+        self.assertEqual(self.values(actor), [])
+        actor.query("ROLLBACK TO SAVEPOINT before_bind")
+        actor.query(f"SELECT auth.bind_self('A','1','{epoch}')", "42501")
+        late.query(f"SELECT auth.bind_self('A','1','{epoch}')", "42501")
+        actor.query("ROLLBACK")
+        late.query("ROLLBACK")
         self.a.query("ROLLBACK")
+        self.begin(actor)
+        actor.query(f"SELECT auth.bind_self('A','1','{epoch}')")
+        self.assertEqual(self.values(actor), ["A1"])
+        actor.query("ROLLBACK")
 
     def test_p06_epoch_rotation_invalidates_binding(self):
         self.issue(self.begin())
@@ -786,7 +858,7 @@ def main():
         print("Server:", with_version.stdout.strip(), "merge SHA:", os.environ.get("GITHUB_SHA", "local"),
               "PR head:", os.environ.get("PROOF_PR_HEAD", "local"), flush=True)
         result = unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromTestCase(Boundary))
-        if not result.wasSuccessful() or result.skipped or result.testsRun != 45:
+        if not result.wasSuccessful() or result.skipped or result.testsRun != 49:
             raise SystemExit(1)
     finally:
         subprocess.run(["docker","rm","-f","-v",NAME],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)

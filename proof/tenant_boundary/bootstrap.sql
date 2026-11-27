@@ -107,9 +107,15 @@ $body$;
 CREATE FUNCTION auth.bind_self(requested_tenant text, requested_bu text, expected_epoch uuid)
 RETURNS void LANGUAGE plpgsql SECURITY DEFINER
 SET search_path=pg_catalog,pg_temp AS $body$
-DECLARE actor text; rev bigint; epoch_value uuid; started timestamptz;
+DECLARE actor text; rev bigint; epoch_value uuid; started timestamptz; deadline timestamptz;
 BEGIN
  IF pg_catalog.current_setting('transaction_isolation') <> 'read committed' THEN
+   RAISE EXCEPTION 'context denied' USING ERRCODE='42501';
+ END IF;
+ -- A savepoint rollback may remove the binding row, but cannot renew the
+ -- top-level transaction deadline. Late initial binding is denied too.
+ deadline := pg_catalog.transaction_timestamp()+interval '30 seconds';
+ IF pg_catalog.clock_timestamp() >= deadline THEN
    RAISE EXCEPTION 'context denied' USING ERRCODE='42501';
  END IF;
  SELECT a.principal,m.revision INTO actor,rev FROM auth.actor_login a
@@ -125,7 +131,7 @@ BEGIN
  INSERT INTO auth.binding(epoch,boot,pid,backend_start,xid,login,principal,tenant,bu,revision,expires)
  VALUES(epoch_value,pg_catalog.pg_postmaster_start_time(),pg_catalog.pg_backend_pid(),
  started,pg_catalog.pg_current_xact_id(),session_user,actor,requested_tenant,requested_bu,rev,
- pg_catalog.clock_timestamp()+interval '30 seconds');
+ deadline);
 END
 $body$;
 CREATE FUNCTION auth.allowed(requested_tenant text, requested_bu text)

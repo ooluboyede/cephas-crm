@@ -43,6 +43,14 @@ class ActorBroker:
         if self._read_state()!=self._state:
             raise Denied("denied")
 
+    @staticmethod
+    def _identity(session, role):
+        rows = session.query("SELECT session_user,pg_backend_pid(),pg_current_xact_id()")
+        if (len(rows) != 1 or not re.fullmatch(r"[a-z0-9_]+\|[1-9][0-9]*\|[1-9][0-9]*", rows[0])
+                or rows[0].split("|")[0] != role):
+            raise Denied("denied")
+        return rows[0]
+
     def execute(self, token, tenant, bu, operation):
         session=None
         try:
@@ -58,13 +66,16 @@ class ActorBroker:
             self._check_state()
             session=self._factory(role)
             session.query("BEGIN ISOLATION LEVEL READ COMMITTED")
-            if session.query("SELECT session_user")!=[role]:
-                raise Denied("denied")
+            identity = self._identity(session, role)
             # All interpolated values are fixed registry literals or validated UUID.
             session.query(f"SELECT auth.bind_self('{tenant}','{bu}','{self._state.epoch}'::uuid)")
             if session.query(f"SELECT auth.allowed('{tenant}','{bu}')")!=["t"]:
                 raise Denied("denied")
+            if self._identity(session, role) != identity:
+                raise Denied("denied")
             rows=session.query(query)
+            if self._identity(session, role) != identity:
+                raise Denied("denied")
             if session.query(f"SELECT auth.allowed('{tenant}','{bu}')")!=["t"]:
                 raise Denied("denied")
             self._check_state()

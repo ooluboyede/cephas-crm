@@ -72,6 +72,7 @@ jobs:
             "docs/engineering/GATE_0_1_11_INDEPENDENT_REVIEW_BRIEF.md"
             "docs/engineering/GATE_0_1_11_1_GOVERNANCE_AND_DESIGN_CLEARANCE.md"
             "docs/engineering/GATE_0_1_12_REMEDIATION_REGISTER.md"
+            "docs/security/GATE_0_1_12_1_ACTOR_BOUNDARY.md"
           )
           for file in "${required_files[@]}"; do
             git ls-files --error-unmatch -- "$file" >/dev/null
