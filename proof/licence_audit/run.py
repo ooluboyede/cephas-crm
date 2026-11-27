@@ -4,6 +4,8 @@ import hashlib
 import subprocess
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
+from state import State
 from pathlib import Path
 
 from protocol import (PRODUCT, LICENCE_DOMAIN, BUNDLE_DOMAIN, CHECKPOINT_DOMAIN,
@@ -145,6 +147,87 @@ class Proof(unittest.TestCase):
         with self.assertRaises(Invalid):
             self.validate()
 
+    def state_fixture(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        path = Path(directory.name) / "authority.sqlite"
+        bundle = self.signed(self.bundle, "root", BUNDLE_DOMAIN)
+        store = State.initialize(path, 2, hashlib.sha256(bundle).hexdigest(), NOW)
+        return store, bundle
+
+    def reserve(self, store, bundle, request, now=NOW):
+        licence = self.signed(self.licence, "licence", LICENCE_DOMAIN)
+        return store.reserve(licence, bundle, self.public("root"), now,
+                             self.binding, "sales", request)
+
+    def test_state_quota_and_duplicate(self):
+        self.licence["limits"]["max_transactions_per_day"] = 1
+        store, bundle = self.state_fixture()
+        self.assertEqual(self.reserve(store,bundle,"one"), "reserved")
+        self.assertEqual(self.reserve(State(store.path),bundle,"one"), "duplicate")
+        with self.assertRaises(Invalid):
+            self.reserve(store,bundle,"two")
+
+    def test_state_quota_concurrency(self):
+        self.licence["limits"]["max_transactions_per_day"] = 1
+        store, bundle = self.state_fixture()
+        licence = self.signed(self.licence, "licence", LICENCE_DOMAIN)
+        public = self.public("root")
+        def attempt(request):
+            try:
+                return store.reserve(licence,bundle,public,NOW,self.binding,"sales",request)
+            except Invalid:
+                return "denied"
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            self.assertCountEqual(list(pool.map(attempt, ["one","two"])), ["reserved","denied"])
+
+    def test_state_trust_floor_and_time_persist(self):
+        store, bundle = self.state_fixture()
+        self.bundle["sequence"] = 3
+        newer = self.signed(self.bundle,"root",BUNDLE_DOMAIN)
+        self.assertEqual(self.reserve(store,newer,"one",NOW+1),"reserved")
+        reopened = State(store.path)
+        with self.assertRaises(Invalid):
+            self.reserve(reopened,bundle,"two",NOW+1)
+        with self.assertRaises(Invalid):
+            self.reserve(reopened,newer,"two",NOW)
+
+    def test_state_missing_and_equal_sequence_conflict(self):
+        store,bundle = self.state_fixture()
+        self.bundle["expires_at"] += 1
+        changed = self.signed(self.bundle,"root",BUNDLE_DOMAIN)
+        with self.assertRaises(Invalid):
+            self.reserve(store,changed,"one")
+        store.path.unlink()
+        with self.assertRaises(Invalid):
+            self.reserve(store,bundle,"two")
+
+    def test_state_zero_quota(self):
+        self.licence["limits"]["max_transactions_per_day"] = 0
+        store,bundle = self.state_fixture()
+        with self.assertRaises(Invalid):
+            self.reserve(store,bundle,"one")
+
+    def test_state_checkpoint_rejects_fork_and_rollback(self):
+        store,_ = self.state_fixture()
+        checkpoint, head = self.checkpoint()
+        self.assertEqual(store.accept_checkpoint(self.events,checkpoint,self.public("audit"),
+                                                 self.scope,2,head),head)
+        original = copy.deepcopy(self.events)
+        self.events[0]["action"] = "delete"
+        fork, fork_head = self.checkpoint()
+        with self.assertRaises(Invalid):
+            store.accept_checkpoint(self.events,fork,self.public("audit"),self.scope,2,fork_head)
+        self.events = original[:1]
+        old, old_head = self.checkpoint()
+        with self.assertRaises(Invalid):
+            store.accept_checkpoint(self.events,old,self.public("audit"),self.scope,1,old_head)
+        self.events = original + [{"event_id": C,"scope":self.scope,"action":"read",
+                                   "outcome":"allowed","timestamp":NOW+2}]
+        newer,new_head = self.checkpoint()
+        self.assertEqual(store.accept_checkpoint(self.events,newer,self.public("audit"),
+                                                 self.scope,3,new_head),new_head)
+
     def checkpoint(self):
         previous = "0" * 64
         for sequence, event in enumerate(self.events, 1):
@@ -190,5 +273,5 @@ if __name__ == "__main__":
     subprocess.run(["openssl", "version"], check=True)
     suite = unittest.defaultTestLoader.loadTestsFromTestCase(Proof)
     result = unittest.TextTestRunner(verbosity=2).run(suite)
-    if result.testsRun != 14 or result.skipped or not result.wasSuccessful():
+    if result.testsRun != 20 or result.skipped or not result.wasSuccessful():
         raise SystemExit(1)

@@ -61,6 +61,7 @@ jobs:
             "docs/architecture/decisions/ADR-0009-transaction-registry-recovery.md"
             "docs/security/GATE_0_1_10_LICENCE_AUDIT_ASSURANCE.md"
             "proof/licence_audit/README.md"
+            "docs/security/GATE_0_1_10_1_ISSUER_STATE_ASSURANCE.md"
           )
           for file in "${required_files[@]}"; do
             git ls-files --error-unmatch -- "$file" >/dev/null
@@ -111,5 +112,5 @@ jobs:
 
       - name: Run disposable licence and audit proof
         run: |
-          python3 -m py_compile proof/licence_audit/protocol.py proof/licence_audit/run.py
+          python3 -m py_compile proof/licence_audit/protocol.py proof/licence_audit/run.py proof/licence_audit/state.py
           python3 proof/licence_audit/run.py
