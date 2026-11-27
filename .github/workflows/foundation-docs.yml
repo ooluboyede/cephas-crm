@@ -71,6 +71,7 @@ jobs:
             "docs/engineering/GATE_0_1_11_OWNER_DECISION_REGISTER.md"
             "docs/engineering/GATE_0_1_11_INDEPENDENT_REVIEW_BRIEF.md"
             "docs/engineering/GATE_0_1_11_1_GOVERNANCE_AND_DESIGN_CLEARANCE.md"
+            "docs/engineering/GATE_0_1_12_REMEDIATION_REGISTER.md"
           )
           for file in "${required_files[@]}"; do
             git ls-files --error-unmatch -- "$file" >/dev/null
@@ -113,7 +114,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Compile proof harness
-        run: python3 -m py_compile proof/tenant_boundary/run.py proof/tenant_boundary/broker.py proof/tenant_boundary/recovery_state.py
+        run: python3 -m py_compile proof/tenant_boundary/run.py proof/tenant_boundary/broker.py proof/tenant_boundary/recovery_state.py proof/tenant_boundary/actor_broker.py
       - name: Run real PostgreSQL proof
         env:
           PROOF_PR_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}

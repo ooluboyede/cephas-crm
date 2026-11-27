@@ -24,3 +24,5 @@ Parent fbc5bea567107c748be518c37c830b251382ae18; Run #12 verified 26/26 (38.474s
 
 ## Gate 0.1.9.4 — Persistent recovery journal
 Verified parent Run #13: 33/33, 46.861s. Current suite expects 39 tests. SQLite recovery journal outside PostgreSQL container persists sequence/epoch and supports explicit operator compare-and-append. Broker reads it at startup and during operations; no auto-adoption from DB. Private directory and trusted operator assumed; not WORM or proof against restoring the journal itself. See ADR-0009 and Gate 0.1.9.4 assessment. Synthetic tests only.
+
+Gate 0.1.12 adds six candidate F-01 actor-specific self-binding tests (45 PostgreSQL expected); legacy issuer path retained only for regression. See docs/engineering/GATE_0_1_12_REMEDIATION_REGISTER.md for remaining findings and approval boundaries.

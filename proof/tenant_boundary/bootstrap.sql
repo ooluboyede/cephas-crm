@@ -9,8 +9,12 @@ CREATE ROLE proof_a1 LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEROLE NOCREATEDB NOREP
 CREATE ROLE proof_a2 LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEROLE NOCREATEDB NOREPLICATION PASSWORD :'proof_a2_pw';
 CREATE ROLE proof_b1 LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEROLE NOCREATEDB NOREPLICATION PASSWORD :'proof_b1_pw';
 CREATE ROLE proof_b2 LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEROLE NOCREATEDB NOREPLICATION PASSWORD :'proof_b2_pw';
+CREATE ROLE proof_alice_a1 LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEROLE NOCREATEDB NOREPLICATION PASSWORD :'proof_alice_a1_pw';
+CREATE ROLE proof_charlie_a1 LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEROLE NOCREATEDB NOREPLICATION PASSWORD :'proof_charlie_a1_pw';
+CREATE ROLE proof_bob_b1 LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEROLE NOCREATEDB NOREPLICATION PASSWORD :'proof_bob_b1_pw';
 REVOKE ALL ON DATABASE postgres FROM PUBLIC;
 GRANT CONNECT ON DATABASE postgres TO proof_runtime, proof_issuer_a, proof_issuer_b, proof_a1, proof_a2, proof_b1, proof_b2;
+GRANT CONNECT ON DATABASE postgres TO proof_alice_a1,proof_charlie_a1,proof_bob_b1;
 REVOKE ALL ON SCHEMA public FROM PUBLIC;
 -- Same-login sessions can otherwise observe one another's SQL text.
 REVOKE SELECT ON pg_catalog.pg_stat_activity FROM PUBLIC;
@@ -51,6 +55,15 @@ CREATE TABLE auth.scope_login (
 );
 INSERT INTO auth.scope_login VALUES ('proof_a1','A','1'),('proof_a2','A','2'),
  ('proof_b1','B','1'),('proof_b2','B','2');
+-- Actor-specific read-only proof path; distinct from legacy target issuer.
+CREATE TABLE auth.actor_login (
+ login name PRIMARY KEY, principal text NOT NULL, tenant text NOT NULL, bu text NOT NULL,
+ UNIQUE(principal,tenant,bu)
+);
+INSERT INTO auth.actor_login VALUES
+ ('proof_alice_a1','alice','A','1'),('proof_charlie_a1','charlie','A','1'),
+ ('proof_bob_b1','bob','B','1');
+INSERT INTO auth.membership VALUES ('charlie','A','1',1,true);
 CREATE TABLE auth.binding (
  epoch uuid NOT NULL, boot timestamptz NOT NULL, pid integer NOT NULL,
  backend_start timestamptz NOT NULL,
@@ -89,11 +102,38 @@ BEGIN
         target_login,actor,requested_tenant,requested_bu,rev,pg_catalog.clock_timestamp()+interval '30 seconds');
 END
 $body$;
+-- No externally selected target tuple. The authenticated session is the
+-- principal and can bind only its own current transaction.
+CREATE FUNCTION auth.bind_self(requested_tenant text, requested_bu text, expected_epoch uuid)
+RETURNS void LANGUAGE plpgsql SECURITY DEFINER
+SET search_path=pg_catalog,pg_temp AS $body$
+DECLARE actor text; rev bigint; epoch_value uuid; started timestamptz;
+BEGIN
+ IF pg_catalog.current_setting('transaction_isolation') <> 'read committed' THEN
+   RAISE EXCEPTION 'context denied' USING ERRCODE='42501';
+ END IF;
+ SELECT a.principal,m.revision INTO actor,rev FROM auth.actor_login a
+ JOIN auth.membership m ON m.principal=a.principal AND m.tenant=a.tenant AND m.bu=a.bu
+ WHERE a.login=session_user AND a.tenant=requested_tenant AND a.bu=requested_bu AND m.active;
+ IF NOT FOUND THEN RAISE EXCEPTION 'context denied' USING ERRCODE='42501'; END IF;
+ SELECT e.value INTO STRICT epoch_value FROM auth.epoch e WHERE singleton;
+ IF epoch_value IS DISTINCT FROM expected_epoch THEN
+   RAISE EXCEPTION 'context denied' USING ERRCODE='42501';
+ END IF;
+ SELECT a.backend_start INTO STRICT started FROM pg_catalog.pg_stat_activity a
+ WHERE a.pid=pg_catalog.pg_backend_pid();
+ INSERT INTO auth.binding(epoch,boot,pid,backend_start,xid,login,principal,tenant,bu,revision,expires)
+ VALUES(epoch_value,pg_catalog.pg_postmaster_start_time(),pg_catalog.pg_backend_pid(),
+ started,pg_catalog.pg_current_xact_id(),session_user,actor,requested_tenant,requested_bu,rev,
+ pg_catalog.clock_timestamp()+interval '30 seconds');
+END
+$body$;
 CREATE FUNCTION auth.allowed(requested_tenant text, requested_bu text)
 RETURNS boolean LANGUAGE sql STABLE SECURITY DEFINER
 SET search_path=pg_catalog,pg_temp AS $body$
  SELECT (session_user='proof_runtime' OR EXISTS (
-  SELECT 1 FROM auth.scope_login s WHERE s.login=session_user AND s.tenant=requested_tenant AND s.bu=requested_bu))
+  SELECT 1 FROM auth.scope_login s WHERE s.login=session_user AND s.tenant=requested_tenant AND s.bu=requested_bu) OR EXISTS (
+  SELECT 1 FROM auth.actor_login a WHERE a.login=session_user AND a.tenant=requested_tenant AND a.bu=requested_bu))
  AND pg_catalog.current_setting('transaction_isolation')='read committed'
  AND EXISTS(
   SELECT 1 FROM auth.binding b
@@ -105,6 +145,9 @@ SET search_path=pg_catalog,pg_temp AS $body$
     AND b.backend_start=(SELECT a.backend_start FROM pg_catalog.pg_stat_activity a WHERE a.pid=pg_catalog.pg_backend_pid())
     AND b.xid=pg_catalog.pg_current_xact_id_if_assigned()
     AND b.login=session_user AND b.tenant=requested_tenant AND b.bu=requested_bu
+    AND (NOT EXISTS (SELECT 1 FROM auth.actor_login a WHERE a.login=session_user) OR EXISTS (
+      SELECT 1 FROM auth.actor_login a WHERE a.login=session_user AND a.principal=b.principal
+      AND a.tenant=b.tenant AND a.bu=b.bu))
     AND b.expires>pg_catalog.statement_timestamp()
  )
 $body$;
@@ -118,6 +161,9 @@ REVOKE ALL ON ALL FUNCTIONS IN SCHEMA auth FROM PUBLIC;
 GRANT USAGE ON SCHEMA auth TO proof_runtime,proof_issuer_a,proof_issuer_b,proof_data_owner,proof_a1, proof_a2, proof_b1, proof_b2;
 GRANT EXECUTE ON FUNCTION auth.issue(integer,xid8,text,text) TO proof_issuer_a,proof_issuer_b;
 GRANT EXECUTE ON FUNCTION auth.current_epoch() TO proof_issuer_a,proof_issuer_b;
+GRANT USAGE ON SCHEMA auth TO proof_alice_a1,proof_charlie_a1,proof_bob_b1;
+GRANT EXECUTE ON FUNCTION auth.bind_self(text,text,uuid) TO proof_alice_a1,proof_charlie_a1,proof_bob_b1;
+GRANT EXECUTE ON FUNCTION auth.allowed(text,text) TO proof_alice_a1,proof_charlie_a1,proof_bob_b1;
 GRANT EXECUTE ON FUNCTION auth.allowed(text,text) TO proof_runtime,proof_data_owner,proof_a1, proof_a2, proof_b1, proof_b2;
 RESET ROLE;
 SET ROLE proof_data_owner;
@@ -135,4 +181,11 @@ CREATE POLICY note_scope ON crm.note TO proof_runtime, proof_a1, proof_a2, proof
 GRANT USAGE ON SCHEMA crm TO proof_runtime, proof_a1, proof_a2, proof_b1, proof_b2;
 GRANT SELECT,INSERT,DELETE ON crm.item,crm.note TO proof_runtime, proof_a1, proof_a2, proof_b1, proof_b2;
 GRANT UPDATE(value) ON crm.item,crm.note TO proof_runtime, proof_a1, proof_a2, proof_b1, proof_b2;
+RESET ROLE;
+
+SET ROLE proof_data_owner;
+CREATE POLICY actor_item_scope ON crm.item FOR SELECT TO proof_alice_a1,proof_charlie_a1,proof_bob_b1 USING (auth.allowed(tenant,bu));
+CREATE POLICY actor_note_scope ON crm.note FOR SELECT TO proof_alice_a1,proof_charlie_a1,proof_bob_b1 USING (auth.allowed(tenant,bu));
+GRANT USAGE ON SCHEMA crm TO proof_alice_a1,proof_charlie_a1,proof_bob_b1;
+GRANT SELECT ON crm.item,crm.note TO proof_alice_a1,proof_charlie_a1,proof_bob_b1;
 RESET ROLE;

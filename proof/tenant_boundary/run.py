@@ -12,13 +12,15 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from broker import Broker, Denied
+from actor_broker import ActorBroker
 from recovery_state import RecoveryState, initialize, advance, read_state
 
 ROOT = Path(__file__).resolve().parent
 NAME = "cephas-proof-" + secrets.token_hex(6)
 PASSWORDS = {role: secrets.token_hex(24) for role in
              ("postgres", "proof_runtime", "proof_issuer_a", "proof_issuer_b",
-              "proof_a1", "proof_a2", "proof_b1", "proof_b2")}
+              "proof_a1", "proof_a2", "proof_b1", "proof_b2",
+              "proof_alice_a1", "proof_charlie_a1", "proof_bob_b1")}
 PINNED_IMAGE = "postgres@sha256:64c8b0d31e4ab6ea665e8426ea406a94bf52de3c05b3a4a8bf713704eefa9328"
 IMAGE = os.environ.get("PROOF_POSTGRES_IMAGE", PINNED_IMAGE)
 if IMAGE != PINNED_IMAGE:
@@ -125,6 +127,84 @@ class Boundary(unittest.TestCase):
         epoch = self.admin.query("SELECT value FROM auth.epoch")[0]
         initialize(journal, epoch)
         return Broker(tokens, factory, lambda: read_state(journal)), tokens
+
+    def actor_epoch(self):
+        return self.admin.query("SELECT value FROM auth.epoch")[0]
+
+    def test_f01_legacy_issuer_cannot_target_actor_connections(self):
+        alice = self.open("proof_alice_a1")
+        charlie = self.open("proof_charlie_a1")
+        for target in (alice, charlie):
+            binding = self.begin(target)
+            self.issue(binding, state="42501")
+            self.assertEqual(self.values(target), [])
+            target.query("ROLLBACK")
+
+    def test_f01_same_scope_actor_binding_and_revocation(self):
+        alice = self.open("proof_alice_a1")
+        charlie = self.open("proof_charlie_a1")
+        epoch = self.actor_epoch()
+        for target in (alice, charlie):
+            self.begin(target)
+            target.query(f"SELECT auth.bind_self('A','1','{epoch}')")
+            self.assertEqual(self.values(target), ["A1"])
+        self.admin.query("UPDATE auth.membership SET active=false,revision=revision+1 WHERE principal='alice' AND tenant='A' AND bu='1'")
+        try:
+            self.assertEqual(self.values(alice), [])
+            self.assertEqual(self.values(charlie), ["A1"])
+        finally:
+            alice.query("ROLLBACK")
+            charlie.query("ROLLBACK")
+            self.admin.query("UPDATE auth.membership SET active=true,revision=revision+1 WHERE principal='alice' AND tenant='A' AND bu='1'")
+
+    def test_f01_actor_cannot_switch_or_issue_foreign_context(self):
+        actor = self.open("proof_alice_a1")
+        victim = self.open("proof_charlie_a1")
+        binding = self.begin(victim)
+        self.issue(binding, issuer=actor, state="42501")
+        actor.query("SET ROLE proof_charlie_a1", "42501")
+        actor.query("SET SESSION AUTHORIZATION proof_charlie_a1", "42501")
+        self.begin(actor)
+        actor.query(f"SELECT auth.bind_self('B','1','{self.actor_epoch()}')", "42501")
+        actor.query("ROLLBACK")
+        self.assertEqual(self.values(victim), [])
+        victim.query("ROLLBACK")
+
+    def test_f01_self_binding_one_transaction_and_read_only(self):
+        actor = self.open("proof_alice_a1")
+        epoch = self.actor_epoch()
+        self.begin(actor)
+        actor.query(f"SELECT auth.bind_self('A','1','{epoch}')")
+        self.assertEqual(self.values(actor), ["A1"])
+        actor.query(f"SELECT auth.bind_self('A','1','{epoch}')", "23505")
+        actor.query("ROLLBACK")
+        self.assertEqual(self.values(actor), [])
+        self.begin(actor)
+        actor.query(f"SELECT auth.bind_self('A','1','{epoch}')")
+        actor.query("UPDATE crm.item SET value='no'", "42501")
+        actor.query("ROLLBACK")
+
+    def test_f01_actor_broker_selects_connection_from_authenticated_identity(self):
+        tokens = {a: secrets.token_hex(32) for a in ("alice","charlie","bob")}
+        epoch = self.actor_epoch()
+        state = RecoveryState(1, epoch)
+        broker = ActorBroker(tokens, Session, lambda: state)
+        self.assertEqual(broker.execute(tokens["alice"],"A","1","list_items"),["A1"])
+        self.assertEqual(broker.execute(tokens["charlie"],"A","1","list_notes"),["note-A1"])
+        self.assertEqual(broker.execute(tokens["bob"],"B","1","list_items"),["B1"])
+        with self.assertRaises(Denied):
+            broker.execute(tokens["alice"],"B","1","list_items")
+        with self.assertRaises(Denied):
+            broker.execute("0"*64,"A","1","list_items")
+
+    def test_f01_broker_rejects_substituted_same_scope_connection(self):
+        tokens = {a: secrets.token_hex(32) for a in ("alice","charlie","bob")}
+        state = RecoveryState(1,self.actor_epoch())
+        def substitute(role):
+            return Session("proof_charlie_a1" if role=="proof_alice_a1" else role)
+        broker = ActorBroker(tokens, substitute, lambda: state)
+        with self.assertRaises(Denied):
+            broker.execute(tokens["alice"],"A","1","list_items")
 
     def recovery_fixture(self):
         directory = tempfile.TemporaryDirectory()
@@ -693,7 +773,8 @@ def main():
                  "-v","runtime_pw="+PASSWORDS["proof_runtime"],
                  "-v","issuer_a_pw="+PASSWORDS["proof_issuer_a"],
                  "-v","issuer_b_pw="+PASSWORDS["proof_issuer_b"]]
-        for role in ("proof_a1", "proof_a2", "proof_b1", "proof_b2"):
+        for role in ("proof_a1", "proof_a2", "proof_b1", "proof_b2",
+                     "proof_alice_a1", "proof_charlie_a1", "proof_bob_b1"):
             args.extend(["-v", role+"_pw="+PASSWORDS[role]])
         setup = subprocess.run(args, input=(ROOT / "bootstrap.sql").read_text(),
                                text=True, capture_output=True)
@@ -705,10 +786,10 @@ def main():
         print("Server:", with_version.stdout.strip(), "merge SHA:", os.environ.get("GITHUB_SHA", "local"),
               "PR head:", os.environ.get("PROOF_PR_HEAD", "local"), flush=True)
         result = unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromTestCase(Boundary))
-        if not result.wasSuccessful() or result.skipped or result.testsRun != 39:
+        if not result.wasSuccessful() or result.skipped or result.testsRun != 45:
             raise SystemExit(1)
     finally:
-        subprocess.run(["docker","rm","-f",NAME],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+        subprocess.run(["docker","rm","-f","-v",NAME],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
 
 
 if __name__ == "__main__":
