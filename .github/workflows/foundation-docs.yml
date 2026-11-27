@@ -66,6 +66,7 @@ jobs:
             "proof/universal_licence/README.md"
             "docs/licensing/GATE_0_1_10_3_CRM_TIER_POLICY.md"
             "docs/security/GATE_0_1_10_3_PERSISTENT_UNIVERSAL_STATE.md"
+            "docs/security/GATE_0_1_10_4_RENEWAL_GOVERNANCE.md"
           )
           for file in "${required_files[@]}"; do
             git ls-files --error-unmatch -- "$file" >/dev/null

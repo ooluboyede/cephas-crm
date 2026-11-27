@@ -130,7 +130,7 @@ export function verifyLicence(raw,keys,c,policy,snapshot=null,previousSnapshot=n
     require(!revocation.revokedKeys.includes(p.keyVersion));
     require(!revocation.entries.some(e=>e.licenseId===p.licenseId));
   }else require(!policy.requireSnapshot&&previousSnapshot===null);
-  return {licenseId:p.licenseId,tier:p.tier.code,keyVersion:p.keyVersion,
+  return {licenseId:p.licenseId,tier:p.tier.code,keyVersion:p.keyVersion,issuedAt:issued,expiresAt:expiry,
     graceActive:c.now>expiry,modules:[...p.modules],features:[...p.features],
     limits:{...p.limits},revocation};
 });}

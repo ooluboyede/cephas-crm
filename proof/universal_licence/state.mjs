@@ -52,9 +52,11 @@ export class EntitlementStore {
     // Explicit operator bootstrap only. Never auto-create a missing store.
     closeSync(openSync(path,'wx',0o600));
     transaction(path,db=>{
-      db.exec("CREATE TABLE authority(id INTEGER PRIMARY KEY CHECK(id=1), config TEXT NOT NULL, licence BLOB NOT NULL, licence_digest TEXT NOT NULL, licence_id TEXT NOT NULL, observed INTEGER NOT NULL, snapshot BLOB, snapshot_digest TEXT, imported INTEGER) STRICT;"
-        +"CREATE TABLE effects(request_id TEXT PRIMARY KEY, action TEXT NOT NULL, target TEXT NOT NULL, quota TEXT NOT NULL, UNIQUE(action,target)) STRICT;");
-      db.prepare('INSERT INTO authority VALUES(1,?,?,?,?,?,?,?,?)').run(configHash(store.#config),raw,hash(raw),licence.licenseId,c.now,snapshot,accepted?.digest??null,accepted===null?null:c.now);
+      db.exec("CREATE TABLE authority(id INTEGER PRIMARY KEY CHECK(id=1), config TEXT NOT NULL, licence BLOB NOT NULL, licence_digest TEXT NOT NULL, licence_id TEXT NOT NULL, issued INTEGER NOT NULL, expiry INTEGER NOT NULL, observed INTEGER NOT NULL, snapshot BLOB, snapshot_digest TEXT, imported INTEGER) STRICT;"
+        +"CREATE TABLE effects(request_id TEXT PRIMARY KEY, action TEXT NOT NULL, target TEXT NOT NULL, quota TEXT NOT NULL, UNIQUE(action,target)) STRICT;"
+        +"CREATE TABLE licence_history(digest TEXT PRIMARY KEY, licence_id TEXT NOT NULL, issued INTEGER NOT NULL, expiry INTEGER NOT NULL) STRICT;");
+      db.prepare('INSERT INTO authority VALUES(1,?,?,?,?,?,?,?,?,?,?)').run(configHash(store.#config),raw,hash(raw),licence.licenseId,licence.issuedAt,licence.expiresAt,c.now,snapshot,accepted?.digest??null,accepted===null?null:c.now);
+      db.prepare('INSERT INTO licence_history VALUES(?,?,?,?)').run(hash(raw),licence.licenseId,licence.issuedAt,licence.expiresAt);
     });
     return store;
   }
@@ -66,6 +68,9 @@ export class EntitlementStore {
     const row=db.prepare('SELECT * FROM authority WHERE id=1').get();
     demand(row&&row.config===configHash(this.#config)&&hash(row.licence)===row.licence_digest);
     demand(Number.isSafeInteger(row.observed)&&row.observed>=0);
+    const history=db.prepare('SELECT licence_id,issued,expiry FROM licence_history WHERE digest=?').get(row.licence_digest);
+    demand(history&&history.licence_id===row.licence_id&&history.issued===row.issued&&history.expiry===row.expiry);
+    demand(Number.isSafeInteger(row.issued)&&Number.isSafeInteger(row.expiry)&&row.issued<row.expiry);
     let prior=null,raw=null;
     if(row.snapshot!==null){
       demand(Number.isSafeInteger(row.imported)&&row.imported<=row.observed&&row.imported>=0);
@@ -86,6 +91,27 @@ export class EntitlementStore {
       return next.digest;
     });
   }
+  // Trusted operator-only path; no API exposure. Same approved installation and
+  // policy. Conservative carry-forward of every quota and idempotency record.
+  renew(raw){
+    return transaction(this.#path,db=>{
+      const {row,prior,raw:snapshot}=this.#load(db),c=this.#context(row.observed);
+      const next=verifyLicence(raw,this.#config.keys,c,this.#config.policy,snapshot,prior);
+      const digest=hash(raw);
+      if(digest===row.licence_digest)return 'duplicate';
+      demand(!db.prepare('SELECT digest FROM licence_history WHERE digest=?').get(digest));
+      // No automatic replacement of a revoked or suspended licence; recovery
+      // requires independently approved rebind. Old expiry need not be valid now.
+      demand(!prior?.entries.some(e=>e.licenseId===row.licence_id));
+      demand(next.issuedAt>=row.issued&&next.expiresAt>row.expiry);
+      // Equal issuedAt supports issuer's same-ID expiry extension; any shorter
+      // expiry or historical digest is rejected, even when signed.
+      db.prepare('INSERT INTO licence_history VALUES(?,?,?,?)').run(digest,next.licenseId,next.issuedAt,next.expiresAt);
+      db.prepare('UPDATE authority SET licence=?,licence_digest=?,licence_id=?,issued=?,expiry=?,observed=? WHERE id=1')
+        .run(raw,digest,next.licenseId,next.issuedAt,next.expiresAt,c.now);
+      return 'renewed';
+    });
+  }
   execute(action,requestId,target){
     const result=transaction(this.#path,db=>{
       const {row,prior,raw}=this.#load(db),c=this.#context(row.observed);
@@ -97,7 +123,7 @@ export class EntitlementStore {
         identifier(requestId);identifier(target);
         const [kind,code,quota]=OPERATIONS[action];q=quota;
         const licence=verifyLicence(Buffer.from(row.licence),this.#config.keys,c,this.#config.policy,raw,prior);
-        demand(licence.licenseId===row.licence_id&&allowsCapability(licence,kind,code));
+        demand(licence.licenseId===row.licence_id&&licence.issuedAt===row.issued&&licence.expiresAt===row.expiry&&allowsCapability(licence,kind,code));
         const existing=db.prepare('SELECT action,target FROM effects WHERE request_id=?').get(requestId);
         if(existing){demand(existing.action===action&&existing.target===target);return 'duplicate';}
         demand(!db.prepare('SELECT request_id FROM effects WHERE action=? AND target=?').get(action,target));

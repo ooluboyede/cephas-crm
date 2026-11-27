@@ -5,6 +5,7 @@ import {mkdtempSync,rmSync,unlinkSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {DatabaseSync} from 'node:sqlite';
+import {Worker} from 'node:worker_threads';
 import {EntitlementStore} from './state.mjs';
 import {Invalid} from './validator.mjs';
 const NOW=1800000000000, iso=n=>new Date(n).toISOString();
@@ -22,7 +23,7 @@ function fixture(t,options={}){
   const path=join(directory,'state.sqlite'),config={binding,keys,policy:{tier:'professional',modules,features,maxLimits:limits,maxGraceDays:0,unlimitedQuotas:[],requireSnapshot:false,...options.policy}};
   let now=NOW;const clock=()=>now;const raw=signed(options.payload??payload());
   const store=EntitlementStore.initialize(path,config,clock,raw,options.snapshot??null);
-  return {store,path,config,clock,setNow:n=>{now=n;},reopen:()=>new EntitlementStore(path,config,clock)};
+  return {store,path,config,clock,raw,setNow:n=>{now=n;},reopen:()=>new EntitlementStore(path,config,clock)};
 }
 test('all five quotas persisted with synthetic atomic effects',t=>{
   const x=fixture(t);
@@ -74,4 +75,53 @@ test('snapshot expires without silently falling back to no snapshot',t=>{
   x.setNow(NOW+101);assert.throws(()=>x.reopen().execute('create_contact','r','a'),Invalid);
   x.reopen().importSnapshot(snap({generatedAt:iso(NOW+100),expiresAt:iso(NOW+500)}));
   assert.equal(x.reopen().execute('create_contact','r','a'),'applied');
+});
+
+test('same-id renewal persists and does not reset quota or idempotency',t=>{
+  const x=fixture(t);x.store.execute('create_contact','r','a');
+  const next=signed({...payload(),expiresAt:iso(NOW+20000)});
+  assert.equal(x.store.renew(next),'renewed');
+  assert.equal(x.reopen().renew(next),'duplicate');
+  assert.equal(x.reopen().execute('create_contact','r','a'),'duplicate');
+  assert.throws(()=>x.reopen().execute('create_contact','r2','b'),Invalid);
+  assert.throws(()=>x.reopen().renew(x.raw),Invalid);
+});
+test('renewal after expiry retains consumed quota and permits entitled unused quota',t=>{
+  const x=fixture(t);x.store.execute('create_contact','r','a');x.setNow(NOW+10001);
+  const next=signed({...payload(),licenseId:'TEST-L2',issuedAt:iso(NOW+10000),expiresAt:iso(NOW+30000)});
+  assert.equal(x.reopen().renew(next),'renewed');
+  assert.throws(()=>x.reopen().execute('create_contact','new','b'),Invalid);
+  assert.equal(x.reopen().execute('read_api','new','b'),'applied');
+});
+test('renewal rejects foreign binding, shortened term and invalid signature',t=>{
+  const x=fixture(t);const p=payload();
+  for(const raw of [signed({...p,customer:{code:'OTHER',name:'Other'},expiresAt:iso(NOW+20000)}),
+    signed({...p,expiresAt:iso(NOW+9000)}),Buffer.from('invalid')])
+    assert.throws(()=>x.reopen().renew(raw),Invalid);
+  assert.equal(x.reopen().execute('create_contact','r','a'),'applied');
+});
+test('revoked predecessor and expired snapshot deny renewal',t=>{
+  const x=fixture(t);const next=signed({...payload(),licenseId:'TEST-L2',expiresAt:iso(NOW+20000)});
+  x.store.importSnapshot(snap({entries:[{licenseId:'TEST-L',status:'revoked',changedAt:iso(NOW-600)}]}));
+  assert.throws(()=>x.reopen().renew(next),Invalid);
+  const y=fixture(t,{snapshot:snap({expiresAt:iso(NOW+100)})});y.setNow(NOW+101);
+  assert.throws(()=>y.reopen().renew(next),Invalid);
+});
+function compete(x,action,ids){
+  const barrier=new SharedArrayBuffer(4);
+  return Promise.all(ids.map(id=>new Promise((resolve,reject)=>{
+    const worker=new Worker(new URL('./state-worker.mjs',import.meta.url),{workerData:{path:x.path,config:x.config,now:x.clock(),action,id,barrier}});
+    worker.once('message',resolve);worker.once('error',reject);
+    worker.once('exit',code=>{if(code!==0)reject(new Error('worker failed'));});
+  })));
+}
+test('concurrent independent SQLite connections cannot overspend quota',async t=>{
+  const x=fixture(t);
+  const results=await compete(x,'create_contact',['a','b']);
+  assert.deepEqual(results.sort(),['applied','denied']);
+  const db=new DatabaseSync(x.path);try{assert.equal(db.prepare("SELECT count(*) AS n FROM effects WHERE quota='transactions'").get().n,1);}finally{db.close();}
+});
+test('concurrent duplicate requests have exactly one effect',async t=>{
+  const x=fixture(t);
+  assert.deepEqual((await compete(x,'activate_user',['same','same'])).sort(),['applied','duplicate']);
 });
