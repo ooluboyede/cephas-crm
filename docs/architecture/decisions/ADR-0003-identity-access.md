@@ -1,6 +1,6 @@
 # ADR-0003: Identity, Authentication and Authorisation
 
-**Status:** Proposed — pending approval  
+**Status:** Proposed — pending approval
 **Date:** 2026-11-25
 
 ## Context

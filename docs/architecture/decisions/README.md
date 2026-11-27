@@ -1,6 +1,6 @@
 # CEPHAS CRM Architecture Decision Register
 
-**Status:** Proposed — pending architecture review and approval  
+**Status:** Proposed — pending architecture review and approval
 **Gate:** 0.1.2
 
 This register contains decisions required before Gate 0.2. These are proposals, not approved decisions. Each ADR must be reviewed against product requirements, security threats, deployment constraints and implementation evidence.

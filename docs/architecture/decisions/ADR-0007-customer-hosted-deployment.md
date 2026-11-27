@@ -1,6 +1,6 @@
 # ADR-0007: Customer-Controlled Deployment and Data Plane
 
-**Status:** Proposed — pending approval  
+**Status:** Proposed — pending approval
 **Date:** 2026-11-25
 
 ## Context

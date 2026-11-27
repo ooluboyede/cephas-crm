@@ -1,6 +1,6 @@
 # ADR-0006: Provider-Independent and Permission-Bound AI
 
-**Status:** Proposed — pending approval  
+**Status:** Proposed — pending approval
 **Date:** 2026-11-25
 
 ## Context

@@ -1,6 +1,6 @@
 # ADR-0004: Database Ownership, Migrations and Data Governance
 
-**Status:** Proposed — pending approval  
+**Status:** Proposed — pending approval
 **Date:** 2026-11-25
 
 ## Context

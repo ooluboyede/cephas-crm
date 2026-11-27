@@ -1,6 +1,6 @@
 # ADR-0002: Database-Enforced Tenant and Business-Unit Isolation
 
-**Status:** Proposed — mandatory security decision, pending approval  
+**Status:** Proposed — mandatory security decision, pending approval
 **Date:** 2026-11-25
 
 ## Context

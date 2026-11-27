@@ -1,6 +1,6 @@
 # ADR-0005: Offline Signed Licence Verification
 
-**Status:** Proposed — pending approval  
+**Status:** Proposed — pending approval
 **Date:** 2026-11-25
 
 ## Context

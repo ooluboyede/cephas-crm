@@ -1,6 +1,6 @@
 # ADR-0001: Modular Monolith as Initial Architecture
 
-**Status:** Proposed — pending approval  
+**Status:** Proposed — pending approval
 **Date:** 2026-11-25
 
 ## Context
