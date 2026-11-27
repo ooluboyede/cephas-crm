@@ -19,7 +19,7 @@ class Denied(Exception):
 
 
 class Broker:
-    def __init__(self, credentials, session_factory):
+    def __init__(self, credentials, session_factory, expected_epoch):
         # Only trusted bootstrap injects credentials and connection factory.
         if set(credentials) != set(_ACTORS):
             raise ValueError("invalid actor registry")
@@ -27,6 +27,10 @@ class Broker:
                for v in credentials.values()) or len(set(credentials.values())) != len(_ACTORS):
             raise ValueError("invalid credential material")
         self._credentials = MappingProxyType(dict(credentials))
+        if not isinstance(expected_epoch, str) or not re.fullmatch(
+                r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', expected_epoch):
+            raise ValueError("invalid expected epoch")
+        self._expected_epoch = expected_epoch
         self._session_factory = session_factory
 
     def _authenticate(self, token):
@@ -56,11 +60,17 @@ class Broker:
                 raise Denied("denied")
             pid, xid = result[0].split("|")
             issuer = self._session_factory(_ACTORS[actor])
+            if issuer.query("SELECT auth.current_epoch()") != [self._expected_epoch]:
+                raise Denied("denied")
             # Scope literals originate exclusively from the fixed allowlist above.
             issuer.query(f"SELECT auth.issue({pid},'{xid}'::xid8,'{tenant}','{bu}')")
             if runtime.query(f"SELECT auth.allowed('{tenant}','{bu}')") != ["t"]:
                 raise Denied("denied")
             rows = runtime.query(query)
+            if issuer.query("SELECT auth.current_epoch()") != [self._expected_epoch]:
+                raise Denied("denied")
+            if runtime.query(f"SELECT auth.allowed('{tenant}','{bu}')") != ["t"]:
+                raise Denied("denied")
             runtime.query("COMMIT")
             return rows
         except Exception:
@@ -68,9 +78,12 @@ class Broker:
         finally:
             # No pooling and no connection exposed to the caller. Closing even on
             # failure is essential; cleanup failure prevents returning data.
-            try:
-                if issuer is not None:
-                    issuer.close()
-            finally:
-                if runtime is not None:
-                    runtime.close()
+            cleanup_failed = False
+            for session in (issuer, runtime):
+                if session is not None:
+                    try:
+                        session.close()
+                    except Exception:
+                        cleanup_failed = True
+            if cleanup_failed:
+                raise Denied("denied") from None

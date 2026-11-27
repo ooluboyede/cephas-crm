@@ -5,6 +5,7 @@ import secrets
 import subprocess
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from broker import Broker, Denied
@@ -64,14 +65,17 @@ class Session:
         try:
             self.p.stdin.write("\\q\n")
             self.p.stdin.flush()
-        except (BrokenPipeError, ValueError):
+        except (BrokenPipeError, ValueError, OSError):
             pass
         try:
             self.p.wait(timeout=5)
         except subprocess.TimeoutExpired:
             self.p.kill()
             self.p.wait()
-        self.p.stdin.close()
+        try:
+            self.p.stdin.close()
+        except (BrokenPipeError, OSError):
+            pass
         self.p.stdout.close()
 
 
@@ -110,7 +114,140 @@ class Boundary(unittest.TestCase):
 
     def broker(self, factory=Session):
         tokens = {actor: secrets.token_hex(32) for actor in ("alice", "bob")}
-        return Broker(tokens, factory), tokens
+        epoch = self.admin.query("SELECT value FROM auth.epoch")[0]
+        return Broker(tokens, factory, epoch), tokens
+
+    def test_p05_cancel_active_statement_and_discard_session(self):
+        scoped = self.open("proof_a1")
+        pid, xid = self.begin(scoped)
+        self.issue((pid, xid))
+        self.assertEqual(self.values(scoped), ["A1"])
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(scoped.query, "SELECT pg_sleep(20)", "57014")
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                if self.admin.query(
+                    f"SELECT count(*) FROM pg_stat_activity WHERE pid={pid} AND wait_event='PgSleep'"
+                ) == ["1"]:
+                    break
+                time.sleep(0.05)
+            else:
+                self.fail("query never entered sleep")
+            self.assertEqual(self.admin.query(f"SELECT pg_cancel_backend({pid})"), ["t"])
+            future.result(timeout=5)
+        scoped.query("ROLLBACK")
+        scoped.close()
+        self.sessions.remove(scoped)
+        replacement = self.open("proof_a1")
+        self.begin(replacement)
+        self.assertEqual(self.values(replacement), [])
+        replacement.query("ROLLBACK")
+        self.issue(self.begin(replacement))
+        self.assertEqual(self.values(replacement), ["A1"])
+        replacement.query("ROLLBACK")
+
+    def test_p05_broker_connection_loss_denies_and_closes(self):
+        opened = []
+        admin = self.admin
+        class LostRuntime(Session):
+            def query(self, sql, state="00000"):
+                if sql.startswith("SELECT value FROM crm.item"):
+                    pid = super().query("SELECT pg_backend_pid()")[0]
+                    admin.query(f"SELECT pg_terminate_backend({pid})")
+                return super().query(sql, state)
+        def factory(role):
+            s = LostRuntime(role) if role == "proof_a1" else Session(role)
+            opened.append(s)
+            return s
+        broker, tokens = self.broker(factory)
+        with self.assertRaisesRegex(Denied, "^denied$"):
+            broker.execute(tokens["alice"], "A", "1", "list_items")
+        self.assertEqual(len(opened), 2)
+        self.assertTrue(all(s.p.poll() is not None for s in opened))
+        healthy, tokens = self.broker()
+        self.assertEqual(healthy.execute(tokens["alice"], "A", "1", "list_items"), ["A1"])
+
+    def test_p05_broker_cleanup_failure_no_result(self):
+        opened = []
+        class BadCleanup(Session):
+            def close(self):
+                super().close()
+                raise RuntimeError("synthetic cleanup failure")
+        def factory(role):
+            s = BadCleanup(role) if role == "proof_issuer_a" else Session(role)
+            opened.append(s)
+            return s
+        broker, tokens = self.broker(factory)
+        with self.assertRaisesRegex(Denied, "^denied$"):
+            broker.execute(tokens["alice"], "A", "1", "list_items")
+        self.assertEqual(len(opened), 2)
+        self.assertTrue(all(s.p.poll() is not None for s in opened))
+
+    def test_p06_external_epoch_mismatch_denies_broker(self):
+        broker, tokens = self.broker()
+        self.assertEqual(broker.execute(tokens["alice"], "A", "1", "list_items"), ["A1"])
+        self.admin.query("UPDATE auth.epoch SET value=gen_random_uuid()")
+        with self.assertRaisesRegex(Denied, "^denied$"):
+            broker.execute(tokens["alice"], "A", "1", "list_items")
+        # Explicit test operator adoption; not automatic on untrusted restore.
+        replacement, new_tokens = self.broker()
+        self.assertEqual(replacement.execute(new_tokens["alice"], "A", "1", "list_items"), ["A1"])
+
+    def test_p06_logical_restore_rejects_rolled_back_epoch(self):
+        # Real pg_dump/pg_restore of authority data into the disposable DB.
+        # No production database or credentials are involved.
+        old_epoch = self.admin.query("SELECT value FROM auth.epoch")[0]
+        self.issue(self.begin())
+        self.assertEqual(self.values(), ["A1"])
+        self.a.query("COMMIT")
+        dump = subprocess.run(
+            ["docker", "exec", "-e", "PGPASSWORD="+PASSWORDS["postgres"], NAME,
+             "pg_dump", "-h", "127.0.0.1", "-U", "postgres", "-d", "postgres",
+             "--data-only", "--table=auth.epoch", "--table=auth.binding",
+             "--table=auth.membership", "--format=custom"],
+            check=True, capture_output=True).stdout
+        self.admin.query("UPDATE auth.membership SET active=false,revision=revision+1 WHERE principal='alice' AND tenant='A' AND bu='1'")
+        self.admin.query("UPDATE auth.epoch SET value=gen_random_uuid()")
+        expected_epoch = self.admin.query("SELECT value FROM auth.epoch")[0]
+        broker, tokens = self.broker()
+        self.assertNotEqual(old_epoch, expected_epoch)
+        try:
+            self.admin.query("TRUNCATE auth.binding,auth.membership,auth.epoch")
+            subprocess.run(
+                ["docker", "exec", "-i", "-e", "PGPASSWORD="+PASSWORDS["postgres"], NAME,
+                 "pg_restore", "-h", "127.0.0.1", "-U", "postgres", "-d", "postgres",
+                 "--data-only", "--exit-on-error"], input=dump, check=True,
+                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            self.assertEqual(self.admin.query("SELECT value FROM auth.epoch"), [old_epoch])
+            self.assertEqual(self.admin.query(
+                "SELECT active FROM auth.membership WHERE principal='alice' AND tenant='A' AND bu='1'"), ["t"])
+            with self.assertRaisesRegex(Denied, "^denied$"):
+                broker.execute(tokens["alice"], "A", "1", "list_items")
+            self.begin()
+            self.assertEqual(self.values(), [])
+            self.a.query("ROLLBACK")
+        finally:
+            # Restore stays quarantined until authority is reconciled and epoch
+            # rotated. Synthetic operator explicitly restores known-good state.
+            self.admin.query("UPDATE auth.membership SET active=true,revision=revision+1 WHERE principal='alice' AND tenant='A' AND bu='1'")
+            self.admin.query("UPDATE auth.epoch SET value=gen_random_uuid()")
+        replacement, new_tokens = self.broker()
+        self.assertEqual(replacement.execute(new_tokens["alice"], "A", "1", "list_items"), ["A1"])
+
+    def test_p04_scope_login_cannot_signal_foreign_backend(self):
+        a = self.open("proof_a1")
+        b = self.open("proof_b1")
+        pid, _ = self.begin(b)
+        a.query(f"SELECT pg_cancel_backend({pid})", "42501")
+        a.query(f"SELECT pg_terminate_backend({pid})", "42501")
+        self.issue((pid, b.query("SELECT pg_current_xact_id()")[0]), tenant="B", issuer=self.ib)
+        self.assertEqual(self.values(b), ["B1"])
+        b.query("ROLLBACK")
+
+    def test_p04_runtime_cannot_read_recovery_epoch_function(self):
+        for role in ("proof_runtime", "proof_a1", "proof_b1"):
+            scoped = self.open(role)
+            scoped.query("SELECT auth.current_epoch()", "42501")
 
     def test_p08_broker_authenticates_and_binds_fresh_sessions(self):
         broker, tokens = self.broker()
@@ -475,7 +612,7 @@ def main():
         print("Server:", with_version.stdout.strip(), "merge SHA:", os.environ.get("GITHUB_SHA", "local"),
               "PR head:", os.environ.get("PROOF_PR_HEAD", "local"), flush=True)
         result = unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromTestCase(Boundary))
-        if not result.wasSuccessful() or result.skipped or result.testsRun != 26:
+        if not result.wasSuccessful() or result.skipped or result.testsRun != 33:
             raise SystemExit(1)
     finally:
         subprocess.run(["docker","rm","-f",NAME],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)

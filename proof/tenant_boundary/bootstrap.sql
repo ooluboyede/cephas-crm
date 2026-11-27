@@ -108,10 +108,16 @@ SET search_path=pg_catalog,pg_temp AS $body$
     AND b.expires>pg_catalog.statement_timestamp()
  )
 $body$;
+CREATE FUNCTION auth.current_epoch()
+RETURNS uuid LANGUAGE sql STABLE SECURITY DEFINER
+SET search_path=pg_catalog,pg_temp AS $body$
+ SELECT value FROM auth.epoch WHERE singleton
+$body$;
 REVOKE ALL ON ALL TABLES IN SCHEMA auth FROM PUBLIC;
 REVOKE ALL ON ALL FUNCTIONS IN SCHEMA auth FROM PUBLIC;
 GRANT USAGE ON SCHEMA auth TO proof_runtime,proof_issuer_a,proof_issuer_b,proof_data_owner,proof_a1, proof_a2, proof_b1, proof_b2;
 GRANT EXECUTE ON FUNCTION auth.issue(integer,xid8,text,text) TO proof_issuer_a,proof_issuer_b;
+GRANT EXECUTE ON FUNCTION auth.current_epoch() TO proof_issuer_a,proof_issuer_b;
 GRANT EXECUTE ON FUNCTION auth.allowed(text,text) TO proof_runtime,proof_data_owner,proof_a1, proof_a2, proof_b1, proof_b2;
 RESET ROLE;
 SET ROLE proof_data_owner;

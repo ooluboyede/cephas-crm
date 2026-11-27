@@ -56,6 +56,7 @@ jobs:
             "proof/tenant_boundary/README.md"
             "docs/security/GATE_0_1_9_1_INTERNAL_ASSESSMENT.md"
             "docs/security/GATE_0_1_9_2_BROKER_ASSESSMENT.md"
+            "docs/security/GATE_0_1_9_3_RECOVERY_ASSESSMENT.md"
           )
           for file in "${required_files[@]}"; do
             git ls-files --error-unmatch -- "$file" >/dev/null
