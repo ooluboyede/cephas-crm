@@ -1,0 +1,2 @@
+# Universal issuer-compatible offline verifier experiment
+Run node --test proof/universal_licence/validator.test.mjs. No dependencies or network; Node 22+ candidate. Synthetic keys only. This verifier is separate from the older CRM-specific candidate protocol and does not accept that envelope. See docs/security/GATE_0_1_10_2_UNIVERSAL_VALIDATOR.md for scope and blockers. Expected 14 tests. Do not use for production issuance or customer entitlement enforcement.
