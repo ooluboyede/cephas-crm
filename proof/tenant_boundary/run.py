@@ -11,7 +11,10 @@ ROOT = Path(__file__).resolve().parent
 NAME = "cephas-proof-" + secrets.token_hex(6)
 PASSWORDS = {role: secrets.token_hex(24) for role in
              ("postgres", "proof_runtime", "proof_issuer_a", "proof_issuer_b")}
-IMAGE = os.environ.get("PROOF_POSTGRES_IMAGE", "postgres:18")
+PINNED_IMAGE = "postgres@sha256:64c8b0d31e4ab6ea665e8426ea406a94bf52de3c05b3a4a8bf713704eefa9328"
+IMAGE = os.environ.get("PROOF_POSTGRES_IMAGE", PINNED_IMAGE)
+if IMAGE != PINNED_IMAGE:
+    raise RuntimeError("unreviewed PostgreSQL image override")
 
 
 def docker(*args, **kwargs):
@@ -47,6 +50,12 @@ class Session:
         if actual != state:
             raise AssertionError(f"expected SQLSTATE {state}, received {actual}")
         return lines if state == "00000" else []
+
+    def reset(self):
+        # Trusted checkout boundary, never hand a raw psql session to a new actor
+        # until rollback and DISCARD ALL both complete. Failure => discard session.
+        self.query("ROLLBACK")
+        self.query("DISCARD ALL")
 
     def close(self):
         try:
@@ -95,6 +104,97 @@ class Boundary(unittest.TestCase):
 
     def values(self, s=None):
         return (s or self.a).query("SELECT value FROM crm.item ORDER BY tenant,bu,id")
+
+    def test_p02_live_target_validation(self):
+        pid, xid = self.begin()
+        self.issue(("2147483647", xid), state="42501")
+        self.issue((pid, str(int(xid) + 1)), state="42501")
+        self.assertEqual(self.values(), [])
+        self.issue((pid, xid))
+        self.assertEqual(self.values(), ["A1"])
+        self.a.query("ROLLBACK")
+        self.issue((pid, xid), state="42501")
+
+    def test_p03_session_reset_prepared_cursor_and_scope_switch(self):
+        self.issue(self.begin())
+        self.a.query("PREPARE scoped AS SELECT value FROM crm.item ORDER BY id")
+        self.assertEqual(self.a.query("EXECUTE scoped"), ["A1"])
+        self.a.query("DECLARE saved CURSOR WITH HOLD FOR SELECT value FROM crm.item")
+        self.a.query("COMMIT")
+        # A retained cursor is sensitive state, not a new RLS authorisation.
+        self.a.reset()
+        self.a.query("FETCH ALL FROM saved", "34000")
+        self.a.query("EXECUTE scoped", "26000")
+        self.issue(self.begin(), tenant="B", issuer=self.ib)
+        self.assertEqual(self.values(), ["B1"])
+        self.a.query("ROLLBACK")
+        self.a.reset()
+        self.assertEqual(self.values(), [])
+
+    def test_p03_prepared_plan_rechecks_scope_without_reset(self):
+        self.issue(self.begin())
+        self.a.query("PREPARE scoped AS SELECT value FROM crm.item ORDER BY id")
+        self.assertEqual(self.a.query("EXECUTE scoped"), ["A1"])
+        self.a.query("COMMIT")
+        self.assertEqual(self.a.query("EXECUTE scoped"), [])
+        self.issue(self.begin(), tenant="B", issuer=self.ib)
+        self.assertEqual(self.a.query("EXECUTE scoped"), ["B1"])
+        self.a.query("ROLLBACK")
+        self.a.reset()
+
+    def test_p04_statistics_and_authority_role_access(self):
+        self.assertEqual(self.admin.query(
+            "SELECT pg_has_role('proof_runtime','pg_read_all_stats','MEMBER')"), ["f"])
+        self.assertEqual(self.admin.query(
+            "SELECT has_table_privilege('proof_runtime','auth.binding','SELECT')"), ["f"])
+        self.assertEqual(self.admin.query(
+            "SELECT has_function_privilege('proof_runtime','auth.issue(integer,xid8,text,text)','EXECUTE')"), ["f"])
+        self.a.query("SET ROLE pg_read_all_stats", "42501")
+        self.a.query("SELECT * FROM pg_catalog.pg_stat_activity", "42501")
+        self.a.query("SELECT * FROM auth.issuer", "42501")
+
+    def test_p05_failed_transaction_reset(self):
+        self.issue(self.begin())
+        self.a.query("SELECT 1/0", "22012")
+        self.a.reset()
+        self.assertEqual(self.values(), [])
+        self.issue(self.begin(), tenant="B", issuer=self.ib)
+        self.assertEqual(self.values(), ["B1"])
+        self.a.query("ROLLBACK")
+
+    def test_p06_epoch_cannot_rebind_active_transaction(self):
+        binding = self.begin()
+        self.issue(binding)
+        self.assertEqual(self.values(), ["A1"])
+        self.admin.query("UPDATE auth.epoch SET value=gen_random_uuid()")
+        self.assertEqual(self.values(), [])
+        self.issue(binding, tenant="B", issuer=self.ib, state="23505")
+        self.assertEqual(self.values(), [])
+        self.a.query("ROLLBACK")
+
+    def test_p06_restart_invalidates_old_binding(self):
+        binding = self.begin()
+        self.issue(binding)
+        self.assertEqual(self.values(), ["A1"])
+        self.a.query("COMMIT")
+        old_boot = self.admin.query("SELECT pg_postmaster_start_time()")[0]
+        for session in reversed(self.sessions):
+            session.close()
+        self.sessions.clear()
+        docker("restart", NAME, stdout=subprocess.DEVNULL)
+        wait_ready()
+        self.admin = self.open("postgres")
+        self.a = self.open("proof_runtime")
+        self.ia = self.open("proof_issuer_a")
+        self.ib = self.open("proof_issuer_b")
+        self.assertNotEqual(self.admin.query("SELECT pg_postmaster_start_time()")[0], old_boot)
+        self.assertEqual(self.admin.query("SELECT count(*)>0 FROM auth.binding"), ["t"])
+        self.begin()
+        self.assertEqual(self.values(), [])
+        self.a.query("ROLLBACK")
+        self.issue(self.begin())
+        self.assertEqual(self.values(), ["A1"])
+        self.a.query("ROLLBACK")
 
     def test_p01_absent_context_and_spoofed_settings(self):
         self.begin()
@@ -242,27 +342,32 @@ class Boundary(unittest.TestCase):
         self.a.query("ROLLBACK")
 
 
+def wait_ready():
+    for _ in range(60):
+        ready = subprocess.run(["docker", "exec", NAME, "pg_isready", "-h", "127.0.0.1"],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if ready.returncode == 0:
+            return
+        time.sleep(1)
+    raise RuntimeError("PostgreSQL did not become ready")
+
+
 def main():
-    # Pull candidate tag once, then execute the immutable resolved image.
+    # The only accepted image is the digest verified in Run #10.
     docker("pull", IMAGE, stdout=subprocess.DEVNULL)
     digest = docker("image", "inspect", "--format", "{{index .RepoDigests 0}}",
                     IMAGE, capture_output=True).stdout.strip()
     if not re.fullmatch(r"[^\s]+@sha256:[0-9a-f]{64}", digest):
         raise RuntimeError("missing immutable image digest")
+    if digest.split("@", 1)[1] != PINNED_IMAGE.split("@", 1)[1]:
+        raise RuntimeError("PostgreSQL digest mismatch")
     print("PostgreSQL image:", digest, flush=True)
     try:
-        docker("run", "-d", "--rm", "--network", "none", "--name", NAME,
+        docker("run", "-d", "--network", "none", "--name", NAME,
                "-e", "POSTGRES_PASSWORD=" + PASSWORDS["postgres"],
                "-e", "POSTGRES_INITDB_ARGS=--auth-host=scram-sha-256",
                digest, stdout=subprocess.DEVNULL)
-        for _ in range(60):
-            ready = subprocess.run(["docker","exec",NAME,"pg_isready","-h","127.0.0.1"],
-                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            if ready.returncode == 0:
-                break
-            time.sleep(1)
-        else:
-            raise RuntimeError("PostgreSQL did not become ready")
+        wait_ready()
         args = command("postgres") + ["-v","ON_ERROR_STOP=1",
                  "-v","runtime_pw="+PASSWORDS["proof_runtime"],
                  "-v","issuer_a_pw="+PASSWORDS["proof_issuer_a"],
@@ -274,9 +379,10 @@ def main():
             raise RuntimeError("bootstrap SQL failed; reproduce with disposable local credentials")
         with_version = subprocess.run(command("postgres")+["-c","SHOW server_version"],
                                       text=True, check=True, capture_output=True)
-        print("Server:",with_version.stdout.strip(),"SHA:",os.environ.get("GITHUB_SHA","local"),flush=True)
+        print("Server:", with_version.stdout.strip(), "merge SHA:", os.environ.get("GITHUB_SHA", "local"),
+              "PR head:", os.environ.get("PROOF_PR_HEAD", "local"), flush=True)
         result = unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromTestCase(Boundary))
-        if not result.wasSuccessful() or result.skipped or result.testsRun != 12:
+        if not result.wasSuccessful() or result.skipped or result.testsRun != 19:
             raise SystemExit(1)
     finally:
         subprocess.run(["docker","rm","-f",NAME],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)

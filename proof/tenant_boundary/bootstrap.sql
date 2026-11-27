@@ -10,6 +10,9 @@ GRANT CONNECT ON DATABASE postgres TO proof_runtime, proof_issuer_a, proof_issue
 REVOKE ALL ON SCHEMA public FROM PUBLIC;
 -- Same-login sessions can otherwise observe one another's SQL text.
 REVOKE SELECT ON pg_catalog.pg_stat_activity FROM PUBLIC;
+-- Narrow verifier/issuer owner needs live backend identity; no runtime membership.
+GRANT pg_read_all_stats TO proof_auth_owner;
+GRANT SELECT ON pg_catalog.pg_stat_activity TO proof_auth_owner;
 DO $block$
 DECLARE f record;
 BEGIN
@@ -18,6 +21,7 @@ BEGIN
     WHERE n.nspname='pg_catalog' AND p.proname IN ('pg_stat_get_activity','pg_stat_get_backend_activity')
   LOOP
     EXECUTE format('REVOKE EXECUTE ON FUNCTION %s FROM PUBLIC', f.identity);
+    EXECUTE format('GRANT EXECUTE ON FUNCTION %s TO proof_auth_owner', f.identity);
   END LOOP;
 END
 $block$;
@@ -26,7 +30,7 @@ CREATE SCHEMA crm AUTHORIZATION proof_data_owner;
 SET ROLE proof_auth_owner;
 ALTER DEFAULT PRIVILEGES REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;
 CREATE TABLE auth.epoch (singleton boolean PRIMARY KEY CHECK (singleton), value uuid NOT NULL);
-INSERT INTO auth.epoch VALUES (true,'00000000-0000-4000-8000-000000000001');
+INSERT INTO auth.epoch VALUES (true,pg_catalog.gen_random_uuid());
 CREATE TABLE auth.issuer (login name PRIMARY KEY, principal text NOT NULL);
 INSERT INTO auth.issuer VALUES ('proof_issuer_a','alice'),('proof_issuer_b','bob');
 CREATE TABLE auth.membership (
@@ -39,17 +43,19 @@ INSERT INTO auth.membership VALUES
  ('bob','B','1',1,true),('bob','B','2',1,true);
 CREATE TABLE auth.binding (
  epoch uuid NOT NULL, boot timestamptz NOT NULL, pid integer NOT NULL,
+ backend_start timestamptz NOT NULL,
  xid xid8 NOT NULL, login name NOT NULL, principal text NOT NULL,
  tenant text NOT NULL, bu text NOT NULL, revision bigint NOT NULL,
  expires timestamptz NOT NULL,
- PRIMARY KEY(epoch,boot,pid,xid,login)
+ -- Epoch change invalidates access but never permits rebinding a live transaction.
+ PRIMARY KEY(boot,pid,backend_start,xid,login)
 );
 -- Separate authenticated broker login is the authority. Runtime cannot call this.
 -- The trusted broker must bind the supplied tuple to its actual pinned connection.
 CREATE FUNCTION auth.issue(target_pid integer, target_xid xid8, requested_tenant text, requested_bu text)
 RETURNS void LANGUAGE plpgsql SECURITY DEFINER
 SET search_path=pg_catalog,pg_temp AS $body$
-DECLARE actor text; rev bigint; deployment_epoch uuid;
+DECLARE actor text; rev bigint; deployment_epoch uuid; target_start timestamptz;
 BEGIN
  IF target_pid IS NULL OR target_pid<=0 OR target_xid IS NULL THEN
    RAISE EXCEPTION 'invalid binding' USING ERRCODE='42501';
@@ -58,9 +64,17 @@ BEGIN
  SELECT m.revision INTO rev FROM auth.membership m
  WHERE m.principal=actor AND m.tenant=requested_tenant AND m.bu=requested_bu AND m.active;
  IF NOT FOUND THEN RAISE EXCEPTION 'scope denied' USING ERRCODE='42501'; END IF;
+ -- PostgreSQL exposes the low 32-bit live XID in activity; the verifier also
+ -- requires exact xid8 in the target session. This is not client authentication.
+ SELECT a.backend_start INTO target_start FROM pg_catalog.pg_stat_activity a
+ WHERE a.pid=target_pid AND a.usename='proof_runtime'
+   AND a.datname=pg_catalog.current_database()
+   AND a.backend_type='client backend' AND a.state='idle in transaction'
+   AND a.backend_xid::text::numeric=pg_catalog.mod(target_xid::text::numeric,4294967296::numeric);
+ IF NOT FOUND THEN RAISE EXCEPTION 'target transaction denied' USING ERRCODE='42501'; END IF;
  SELECT e.value INTO STRICT deployment_epoch FROM auth.epoch e WHERE e.singleton;
- INSERT INTO auth.binding(epoch,boot,pid,xid,login,principal,tenant,bu,revision,expires)
- VALUES(deployment_epoch,pg_catalog.pg_postmaster_start_time(),target_pid,target_xid,
+ INSERT INTO auth.binding(epoch,boot,pid,backend_start,xid,login,principal,tenant,bu,revision,expires)
+ VALUES(deployment_epoch,pg_catalog.pg_postmaster_start_time(),target_pid,target_start,target_xid,
         'proof_runtime',actor,requested_tenant,requested_bu,rev,pg_catalog.clock_timestamp()+interval '30 seconds');
 END
 $body$;
@@ -76,6 +90,7 @@ SET search_path=pg_catalog,pg_temp AS $body$
    AND m.bu=b.bu AND m.active AND m.revision=b.revision
   WHERE b.boot=pg_catalog.pg_postmaster_start_time()
     AND b.pid=pg_catalog.pg_backend_pid()
+    AND b.backend_start=(SELECT a.backend_start FROM pg_catalog.pg_stat_activity a WHERE a.pid=pg_catalog.pg_backend_pid())
     AND b.xid=pg_catalog.pg_current_xact_id_if_assigned()
     AND b.login=session_user AND b.tenant=requested_tenant AND b.bu=requested_bu
     AND b.expires>pg_catalog.statement_timestamp()
