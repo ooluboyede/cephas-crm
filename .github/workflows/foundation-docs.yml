@@ -81,6 +81,7 @@ jobs:
             "docs/security/GATE_0_1_14_1_CALLBACK_SESSION_REMEDIATION.md"
             "docs/security/GATE_0_1_14_2_BACKEND_ENTITLEMENT_BOUNDARY.md"
             "docs/licensing/GATE_0_1_14_3_ISSUER_CERTIFICATION_PREFLIGHT.md"
+            "docs/security/GATE_0_1_14_4_ATOMIC_MUTATION_CERTIFICATION.md"
           )
           for file in "${required_files[@]}"; do
             git ls-files --error-unmatch -- "$file" >/dev/null
@@ -128,6 +129,7 @@ jobs:
         run: |
           node --check proof/universal_licence/read_bridge.mjs
           node --check proof/universal_licence/read_fixture.mjs
+          node --check proof/universal_licence/mutation_claim.mjs
       - name: Run real PostgreSQL proof
         env:
           PROOF_PR_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}

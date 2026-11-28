@@ -195,3 +195,73 @@ CREATE POLICY actor_note_scope ON crm.note FOR SELECT TO proof_alice_a1,proof_ch
 GRANT USAGE ON SCHEMA crm TO proof_alice_a1,proof_charlie_a1,proof_bob_b1;
 GRANT SELECT ON crm.item,crm.note TO proof_alice_a1,proof_charlie_a1,proof_bob_b1;
 RESET ROLE;
+
+-- Disposable licensed contact mutation. Separate from the read-only proof.
+CREATE SCHEMA entproof AUTHORIZATION proof_data_owner;
+REVOKE ALL ON SCHEMA entproof FROM PUBLIC;
+SET ROLE proof_data_owner;
+CREATE TABLE entproof.grant_state (
+ singleton boolean PRIMARY KEY CHECK(singleton),
+ licence_digest text NOT NULL CHECK(licence_digest ~ '^[0-9a-f]{64}$'),
+ snapshot_digest text NOT NULL CHECK(snapshot_digest ~ '^[0-9a-f]{64}$'),
+ epoch uuid NOT NULL, expires timestamptz NOT NULL,
+ cap bigint NOT NULL CHECK(cap BETWEEN 0 AND 9007199254740991),
+ used bigint NOT NULL DEFAULT 0 CHECK(used>=0 AND used<=cap),
+ enabled boolean NOT NULL
+);
+CREATE TABLE entproof.contact (
+ tenant text NOT NULL, bu text NOT NULL, target text NOT NULL,
+ PRIMARY KEY(tenant,bu,target)
+);
+ALTER TABLE entproof.contact ENABLE ROW LEVEL SECURITY;
+ALTER TABLE entproof.contact FORCE ROW LEVEL SECURITY;
+CREATE POLICY contact_scope ON entproof.contact TO proof_data_owner
+ USING(auth.allowed(tenant,bu)) WITH CHECK(auth.allowed(tenant,bu));
+CREATE TABLE entproof.audit (
+ request_id text PRIMARY KEY, actor name NOT NULL,
+ tenant text NOT NULL, bu text NOT NULL, target text NOT NULL,
+ licence_digest text NOT NULL, epoch uuid NOT NULL, recorded timestamptz NOT NULL,
+ action text NOT NULL CHECK(action='create_contact'),
+ FOREIGN KEY(tenant,bu,target) REFERENCES entproof.contact(tenant,bu,target),
+ UNIQUE(tenant,bu,target)
+);
+CREATE FUNCTION entproof.create_contact(request_key text, target_key text, expected_epoch uuid)
+RETURNS text LANGUAGE plpgsql SECURITY DEFINER
+SET search_path=pg_catalog,pg_temp AS $body$
+DECLARE g entproof.grant_state%ROWTYPE; previous entproof.audit%ROWTYPE;
+BEGIN
+ IF session_user NOT IN ('proof_alice_a1','proof_charlie_a1')
+    OR request_key IS NULL OR request_key !~ '^[a-z0-9_]{1,64}$'
+    OR target_key IS NULL OR target_key !~ '^[a-z0-9_]{1,64}$'
+    OR NOT auth.allowed('A','1') THEN
+    RAISE EXCEPTION 'operation denied' USING ERRCODE='42501';
+ END IF;
+ -- Serializes quota spending, duplicate requests and cooperative revocation.
+ SELECT * INTO g FROM entproof.grant_state WHERE singleton FOR UPDATE;
+ IF NOT FOUND OR NOT g.enabled OR g.epoch IS DISTINCT FROM expected_epoch
+    OR clock_timestamp()>=g.expires
+    OR clock_timestamp()>=transaction_timestamp()+interval '30 seconds'
+    OR NOT auth.allowed('A','1') THEN
+    RAISE EXCEPTION 'operation denied' USING ERRCODE='42501';
+ END IF;
+ SELECT * INTO previous FROM entproof.audit WHERE request_id=request_key;
+ IF FOUND THEN
+   IF previous.actor<>session_user OR previous.target<>target_key
+      OR previous.licence_digest<>g.licence_digest OR previous.epoch<>g.epoch THEN
+     RAISE EXCEPTION 'operation denied' USING ERRCODE='42501';
+   END IF;
+   RETURN 'duplicate';
+ END IF;
+ IF g.used>=g.cap THEN RAISE EXCEPTION 'operation denied' USING ERRCODE='42501'; END IF;
+ INSERT INTO entproof.contact VALUES('A','1',target_key);
+ INSERT INTO entproof.audit VALUES(request_key,session_user,'A','1',target_key,
+    g.licence_digest,g.epoch,clock_timestamp(),'create_contact');
+ UPDATE entproof.grant_state SET used=used+1 WHERE singleton;
+ RETURN 'applied';
+END
+$body$;
+REVOKE ALL ON ALL TABLES IN SCHEMA entproof FROM PUBLIC;
+REVOKE ALL ON FUNCTION entproof.create_contact(text,text,uuid) FROM PUBLIC;
+GRANT USAGE ON SCHEMA entproof TO proof_alice_a1,proof_charlie_a1,proof_bob_b1;
+GRANT EXECUTE ON FUNCTION entproof.create_contact(text,text,uuid) TO proof_alice_a1,proof_charlie_a1;
+RESET ROLE;

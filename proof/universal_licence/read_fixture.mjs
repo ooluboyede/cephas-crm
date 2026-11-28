@@ -12,7 +12,7 @@ if(mode==='revoke'){
   new EntitlementStore(path,{...c,keys:new Map(c.keys)},()=>now)
     .importSnapshot(readFileSync(join(dir,'revoked.json')));
 }else if(mode==='init'){
-  if(!['full','no_notes','no_api','zero'].includes(profile))throw new Error('profile');
+  if(!['full','no_notes','no_api','zero','no_contact','zero_tx'].includes(profile))throw new Error('profile');
   const pair=generateKeyPairSync('ed25519'), der=pair.publicKey.export({type:'spki',format:'der'});
   const keys=[['v1',{status:'active',material:der.toString('base64'),
     fingerprint:'sha256:'+createHash('sha256').update(der).digest('hex')}]];
@@ -25,12 +25,14 @@ if(mode==='revoke'){
     product:{code:'CEPHAS_CRM',name:'CEPHAS CRM'},tier:{code:'professional',name:'Professional'},
     deployment:{id:'TEST-D',model:'on_premises',environment:'staging'},issuedAt:iso(now-1000),
     expiresAt:iso(now+120000),gracePeriodDays:0,
-    limits:{...limits,apiCalls:profile==='zero'?0:2},
-    modules:profile==='no_notes'?['contact_management']:modules,
+    limits:{...limits,apiCalls:profile==='zero'?0:2,transactions:profile==='zero_tx'?0:1},
+    modules:profile==='no_notes'?['contact_management']:profile==='no_contact'?['customer_service']:modules,
     features:profile==='no_api'?[]:features,keyVersion:'v1'});
   const snap=(generation,entries)=>signed({schemaVersion:'1.0',snapshotId:'TEST-S',customerCode:binding.customerCode,productCode:binding.productCode,deploymentId:binding.deploymentId,environment:binding.environment,
     generatedAt:iso(generation),expiresAt:iso(generation+300000),keyVersion:'v1',revokedKeyVersions:[],entries});
   EntitlementStore.initialize(path,{binding,keys:new Map(keys),policy,issuerProfile:'current-v1'},()=>now,raw,snap(now-1000,[]));
+  writeFileSync(join(dir,'licence.json'),raw,{flag:'wx',mode:0o600});
+  writeFileSync(join(dir,'snapshot.json'),snap(now-1000,[]),{flag:'wx',mode:0o600});
   writeFileSync(join(dir,'config.json'),JSON.stringify({binding,keys,policy,issuerProfile:'current-v1'}),{flag:'wx',mode:0o600});
   writeFileSync(join(dir,'revoked.json'),snap(now,[{licenseId:'TEST-L',status:'revoked',changedAt:iso(now)}]),{flag:'wx',mode:0o600});
 }else throw new Error('mode');

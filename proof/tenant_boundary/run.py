@@ -1,5 +1,6 @@
 """Disposable real PostgreSQL proof; no customer data or production secrets."""
 import os
+import json
 import re
 import secrets
 import subprocess
@@ -856,6 +857,135 @@ class Boundary(unittest.TestCase):
         finally:
             db.close()
 
+    def mutation_fixture(self,profile="full",install=True):
+        directory=tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        path=Path(directory.name)
+        helper=ROOT.parent/"universal_licence"/"read_fixture.mjs"
+        subprocess.run(["node",str(helper),"init",str(path),str(time.time_ns()//1000000),profile],
+                       check=True,capture_output=True,timeout=15)
+        self.admin.query("TRUNCATE entproof.audit,entproof.contact,entproof.grant_state")
+        epoch=self.actor_epoch()
+        def claim(mode="initial"):
+            result=subprocess.run(["node",str(ROOT.parent/"universal_licence"/"mutation_claim.mjs"),str(path),mode],
+                                  capture_output=True,text=True,timeout=10)
+            if result.returncode:
+                raise Denied("grant denied")
+            c=json.loads(result.stdout)
+            self.assertEqual(set(c),{"licence","snapshot","cap","expiry"})
+            for k in ("licence","snapshot"):
+                self.assertRegex(c[k],r"^[0-9a-f]{64}$")
+            self.assertIs(type(c["cap"]),int)
+            self.assertIs(type(c["expiry"]),int)
+            self.assertGreaterEqual(c["cap"],0)
+            return c
+        if install:
+            c=claim()
+            self.admin.query(f"INSERT INTO entproof.grant_state VALUES(true,'{c['licence']}','{c['snapshot']}','{epoch}',to_timestamp({c['expiry']}/1000.0),{c['cap']},0,true)")
+        return epoch,claim
+
+    def mutation_session(self,epoch,role="proof_alice_a1"):
+        s=self.open(role)
+        self.begin(s)
+        s.query(f"SELECT auth.bind_self('A','1','{epoch}')")
+        return s
+
+    def mutation_counts(self):
+        return self.admin.query("SELECT (SELECT count(*) FROM entproof.contact),(SELECT count(*) FROM entproof.audit),(SELECT used FROM entproof.grant_state)")
+
+    def test_f04_atomic_contact_quota_audit_and_rollback(self):
+        epoch,claim=self.mutation_fixture()
+        s=self.mutation_session(epoch)
+        self.assertEqual(s.query(f"SELECT entproof.create_contact('r1','c1','{epoch}')"),["applied"])
+        s.query("ROLLBACK")
+        self.assertEqual(self.mutation_counts(),["0|0|0"])
+        s=self.mutation_session(epoch)
+        self.assertEqual(s.query(f"SELECT entproof.create_contact('r1','c1','{epoch}')"),["applied"])
+        s.query("COMMIT")
+        self.assertEqual(self.mutation_counts(),["1|1|1"])
+
+    def test_f04_mutation_idempotency_actor_and_request_binding(self):
+        epoch,claim=self.mutation_fixture()
+        s=self.mutation_session(epoch)
+        s.query(f"SELECT entproof.create_contact('r1','c1','{epoch}')")
+        s.query("COMMIT")
+        s=self.mutation_session(epoch)
+        self.assertEqual(s.query(f"SELECT entproof.create_contact('r1','c1','{epoch}')"),["duplicate"])
+        s.query(f"SELECT entproof.create_contact('r1','c2','{epoch}')","42501")
+        s.query("ROLLBACK")
+        other=self.mutation_session(epoch,"proof_charlie_a1")
+        other.query(f"SELECT entproof.create_contact('r1','c1','{epoch}')","42501")
+        other.query("ROLLBACK")
+        self.assertEqual(self.mutation_counts(),["1|1|1"])
+
+    def test_f04_concurrent_postgres_mutations_cannot_overspend(self):
+        from threading import Barrier
+        epoch,claim=self.mutation_fixture()
+        barrier=Barrier(2,timeout=10)
+        def write(role,key):
+            s=Session(role)
+            try:
+                self.begin(s)
+                s.query(f"SELECT auth.bind_self('A','1','{epoch}')")
+                barrier.wait()
+                try:
+                    s.query(f"SELECT entproof.create_contact('{key}','{key}','{epoch}')")
+                    s.query("COMMIT")
+                    return "applied"
+                except AssertionError as exc:
+                    if "received 42501" not in str(exc):
+                        raise
+                    s.query("ROLLBACK")
+                    return "denied"
+            finally:
+                s.close()
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures=[pool.submit(write,role,key) for role,key in
+                     (("proof_alice_a1","a"),("proof_charlie_a1","b"))]
+            self.assertEqual(sorted(x.result(timeout=20) for x in futures),["applied","denied"])
+        self.assertEqual(self.mutation_counts(),["1|1|1"])
+
+    def test_f04_mutation_missing_capability_zero_quota_and_revocation(self):
+        epoch,claim=self.mutation_fixture("no_contact",install=False)
+        with self.assertRaises(Denied):
+            claim()
+        s=self.mutation_session(epoch)
+        s.query(f"SELECT entproof.create_contact('r1','c1','{epoch}')","42501")
+        s.query("ROLLBACK")
+        epoch,claim=self.mutation_fixture("zero_tx")
+        s=self.mutation_session(epoch)
+        s.query(f"SELECT entproof.create_contact('r1','c1','{epoch}')","42501")
+        s.query("ROLLBACK")
+        self.assertEqual(self.mutation_counts(),["0|0|0"])
+        epoch,claim=self.mutation_fixture()
+        with self.assertRaises(Denied):
+            claim("revoked")
+        # Explicit trusted operator disables installed grant. Automatic signed
+        # snapshot import into this PostgreSQL grant is not implemented.
+        self.admin.query("UPDATE entproof.grant_state SET enabled=false")
+        s=self.mutation_session(epoch)
+        s.query(f"SELECT entproof.create_contact('r1','c1','{epoch}')","42501")
+        s.query("ROLLBACK")
+        self.assertEqual(self.mutation_counts(),["0|0|0"])
+
+    def test_f04_mutation_direct_access_expiry_and_epoch_denied(self):
+        epoch,claim=self.mutation_fixture()
+        s=self.open("proof_alice_a1")
+        s.query("UPDATE entproof.grant_state SET cap=100","42501")
+        s.query("INSERT INTO entproof.contact VALUES('A','1','bypass')","42501")
+        s.query("DELETE FROM entproof.audit","42501")
+        s.query(f"SELECT entproof.create_contact('r1','c1','{epoch}')","42501")
+        bob=self.open("proof_bob_b1")
+        bob.query(f"SELECT entproof.create_contact('r1','c1','{epoch}')","42501")
+        s=self.mutation_session(epoch)
+        s.query(f"SELECT entproof.create_contact('r1','c1','{uuid.uuid4()}')","42501")
+        s.query("ROLLBACK")
+        self.admin.query("UPDATE entproof.grant_state SET expires=clock_timestamp()-interval '1 second'")
+        s=self.mutation_session(epoch)
+        s.query(f"SELECT entproof.create_contact('r1','c1','{epoch}')","42501")
+        s.query("ROLLBACK")
+        self.assertEqual(self.mutation_counts(),["0|0|0"])
+
     def recovery_fixture(self):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
@@ -1460,7 +1590,7 @@ def main():
         print("Server:", with_version.stdout.strip(), "merge SHA:", os.environ.get("GITHUB_SHA", "local"),
               "PR head:", os.environ.get("PROOF_PR_HEAD", "local"), flush=True)
         result = unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromTestCase(Boundary))
-        if not result.wasSuccessful() or result.skipped or result.testsRun != 85:
+        if not result.wasSuccessful() or result.skipped or result.testsRun != 90:
             raise SystemExit(1)
     finally:
         for container in (NAME, AUTHORITY_NAME):
