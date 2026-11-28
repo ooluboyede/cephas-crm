@@ -1,0 +1,14 @@
+# Gate 0.1.11.1 — Governance verification and architecture reconciliation
+Status: configuration verified; architecture acceptance NOT GRANTED. Parent a560977cf9e54b26a335b4a38efcc2f8949389a1; Run #21 45991001806 verified 87 tests. This documentation successor has no new test cases and requires exact CI evidence. PR #1 remains draft and unmerged.
+
+## G01 verification
+Ruleset CRM 28230384 active, target refs/heads/main, no exclusions; Restrict updates absent; deletion and non_fast_forward present; pull request one approval, dismiss stale reviews, require last push approval, resolve threads, extra approval for unattributed changes; strict required status checks Validate foundation artefacts and Disposable PostgreSQL boundary proof (integration 15368), do_not_enforce_on_create false. Empty bypass list. Owner correction observed, no configuration mutation performed. No merge attempted. C-08 remains open for designated independent reviewer and actual approval. No working-branch coverage claim.
+
+## D11 reconciliation
+ADR-0005 and OFFLINE_LICENSING now explicitly propose actual issuer v1.0 as sole production wire format. No CRM-specific fallback, no invented record or tenant claims. Historical proof documents retained with their experimental status. ADR-0003 proposes external customer IdP only initially, explicit trust and authorization boundary, no local fallback. These are proposed refinements, not owner or independent approval. D11-01 through D11-08 still require decision authority; C-01/C-09 remain critical. No product features or Gate 0.2 implementation.
+
+## Recommended review boundary and disposition
+Do not require production implementation to evaluate the architecture. Conduct one preliminary independent review of the exact verified successor and the consolidated brief. Ask reviewer to separate design defects that must be resolved before Gate 0.2 from implementation tasks that can be gated under a formally approved scope. Do not weaken original acceptance requirements: demonstrable synthetic isolation exists but its threat scope, production identity mapping, independent recovery/audit custody and external issuer fixture require explicit disposition. If reviewer recommends a scoped Gate 0.2 proof-only exception, document authority, scope, test conditions, expiry and prohibited activities; no implicit exception.
+
+## Remaining dependencies
+Named independent reviewer; owner decisions D11-01–08; final isolation profile and external recovery/audit custody selection; actual approved issuer tier policy and signed nonproduction artifact; runtime and dependency qualification; IdP/session profile, worker/webhook contracts and DR acceptance targets. No issuer changes or signing-key access. No final acceptance or merge. Review the complete blocker register rather than increasing experimental test count.

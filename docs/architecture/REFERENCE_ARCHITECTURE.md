@@ -23,13 +23,13 @@ Initial bounded contexts: Identity & Access; Tenancy & Organisation; Customer & 
 - Every tenant-owned record carries a non-null tenant identifier.
 - Business-unit-owned records carry a validated business-unit identifier where required.
 - Tenant and business-unit membership/hierarchy are enforced by database constraints and policies.
-- PostgreSQL Row-Level Security (RLS) is the default for tenant-owned tables, subject to a table-by-table policy inventory.
+- PostgreSQL ENABLE and FORCE ROW LEVEL SECURITY are mandatory for protected tenant/BU data tables, with explicit policies and inventory. Protected authority metadata uses separate restricted roles and reviewed interfaces; no direct runtime access.
 - Application tenant context is established only after authenticating the principal and resolving authorized membership.
-- Use transaction-scoped database context. Never trust a browser/API tenant ID without server-side authorization.
+- Use authenticated transaction-bound context verified by the database as proposed in Gate 0.1.5 and 0.1.8. Mutable session settings carry untrusted data, not authority. Never trust browser/API tenant IDs without verification; single BU per transaction initially, no null/wildcard.
 - Connection pooling must not leak context between transactions; reset context safely.
 - Background jobs, exports, analytics, scheduled tasks and integration workers carry server-created verified tenant execution context and re-authorize at execution time.
 - Missing, malformed or expired context fails closed.
-- Normal runtime roles must not own protected tables or have BYPASSRLS. Evaluate FORCE ROW LEVEL SECURITY where appropriate.
+- Normal runtime roles must not own protected tables or have BYPASSRLS. Require FORCE ROW LEVEL SECURITY on protected tenant/BU data tables. Shared multi-tenancy is disabled unless the same-role arbitrary SQL isolation proof passes; see Gate 0.1.8 for bounded threat scope.
 - Test cross-tenant reads, writes, updates, deletes, joins, aggregates, exports and identifier guessing.
 
 ## 5. Identity and authorization

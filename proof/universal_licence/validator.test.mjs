@@ -1,0 +1,38 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {generateKeyPairSync,sign,createHash} from 'node:crypto';
+import {verifyLicence,verifySnapshot,allowsQuota,allowsCapability,Invalid} from './validator.mjs';
+const NOW=1800000000000, iso=n=>new Date(n).toISOString();
+const pair=generateKeyPairSync('ed25519'), second=generateKeyPairSync('ed25519');
+const key=(p,status='active')=>{const der=p.publicKey.export({type:'spki',format:'der'});return{
+  status,material:der.toString('base64'),fingerprint:'sha256:'+createHash('sha256').update(der).digest('hex')};};
+const keys=new Map([['v1',key(pair)],['v2',key(second)]]);
+const c={productCode:'CEPHAS_CRM',customerCode:'TEST',deploymentId:'TEST-D',environment:'test',now:NOW,previousTime:NOW};
+const limits={users:10,transactions:100,apiCalls:100,sites:1,businessUnits:1};
+const policy={tier:'professional',modules:['contact_management','lead_management'],features:['api_access'],
+  maxLimits:limits,maxGraceDays:0,unlimitedQuotas:[],requireSnapshot:false};
+const payload=()=>({schemaVersion:'1.0',licenseId:'TEST-L',customer:{code:'TEST',name:'Test – É'},
+  product:{code:'CEPHAS_CRM',name:'CEPHAS CRM'},tier:{code:'professional',name:'Professional'},
+  deployment:{id:'TEST-D',model:'on_premises',environment:'test'},
+  issuedAt:iso(NOW-1000),expiresAt:iso(NOW+1000),gracePeriodDays:0,
+  limits:{...limits},modules:['contact_management'],features:['api_access'],keyVersion:'v1'});
+// Replicates actual issuer export construction, separate from verifier.
+function exportSigned(p,k=pair){return Buffer.from(JSON.stringify({payload:p,
+ signature:sign(null,Buffer.from(JSON.stringify(p),'utf8'),k.privateKey).toString('base64url'),algorithm:'Ed25519'}));}
+function snap(overrides={}){return {schemaVersion:'1.0',snapshotId:'TEST-S',customerCode:'TEST',productCode:'CEPHAS_CRM',deploymentId:'TEST-D',environment:'test',
+  generatedAt:iso(NOW-500),expiresAt:iso(NOW+1000),keyVersion:'v1',revokedKeyVersions:[],entries:[],...overrides};}
+const check=(p=payload(),opts={})=>verifyLicence(opts.raw??exportSigned(p),opts.keys??keys,opts.c??c,opts.policy??policy,opts.snapshot??null,opts.previous??null);
+test('issuer export with unicode and insertion-order payload',()=>{const x=check();assert.equal(x.licenseId,'TEST-L');assert.equal(x.tier,'professional');});
+test('wrong signature, reordered payload and tamper',()=>{const raw=exportSigned(payload());const a=JSON.parse(raw);a.payload={...Object.fromEntries(Object.entries(a.payload).reverse())};for(const bad of [Buffer.from(JSON.stringify(a)),Buffer.from(raw.toString().replace('TEST-L','TEST-M')),exportSigned(payload(),second)])assert.throws(()=>check(payload(),{raw:bad}),Invalid);});
+test('duplicate fields, whitespace, BOM and bad signature encoding',()=>{const raw=exportSigned(payload());for(const bad of [Buffer.from(raw.toString().replace('"schemaVersion":"1.0"','"schemaVersion":"1.0","schemaVersion":"1.0"')),Buffer.concat([Buffer.from(' '),raw]),Buffer.concat([Buffer.from([239,187,191]),raw]),Buffer.from(JSON.stringify({...JSON.parse(raw),signature:JSON.parse(raw).signature+'='}))])assert.throws(()=>check(payload(),{raw:bad}),Invalid);});
+test('wrong scope and product',()=>{for(const [field,change] of [['customer',{code:'OTHER',name:'Test'}],['product',{code:'OTHER',name:'Test'}],['deployment',{id:'OTHER',model:'on_premises',environment:'test'}],['deployment',{id:'TEST-D',model:'on_premises',environment:'production'}]])assert.throws(()=>check({...payload(),[field]:change}),Invalid);});
+test('unknown schema, algorithm, extra fields',()=>{for(const p of [{...payload(),schemaVersion:'2.0'},{...payload(),extra:1}])assert.throws(()=>check(p),Invalid);const a=JSON.parse(exportSigned(payload()));a.algorithm='none';assert.throws(()=>check(payload(),{raw:Buffer.from(JSON.stringify(a))}),Invalid);});
+test('unknown and revoked key, wrong fingerprint, valid rotation',()=>{assert.throws(()=>check({...payload(),keyVersion:'v3'}),Invalid);for(const k of [{...key(pair),status:'revoked'},{...key(pair),fingerprint:'sha256:'+'0'.repeat(64)}])assert.throws(()=>check(payload(),{keys:new Map([['v1',k]])}),Invalid);assert.equal(check(payload(),{raw:exportSigned({...payload(),keyVersion:'v2'},second)}).keyVersion,'v2');});
+test('retired key verification window',()=>{const retired=new Map([['v1',{...key(pair,'retired'),verifyUntil:NOW}]]);assert.equal(check(payload(),{keys:retired}).keyVersion,'v1');assert.throws(()=>check(payload(),{keys:new Map([['v1',{...key(pair,'retired'),verifyUntil:NOW-1}]])}),Invalid);});
+test('expiry boundary, clock rollback and grace policy',()=>{assert.equal(check({...payload(),expiresAt:iso(NOW)}).graceActive,false);assert.throws(()=>check({...payload(),expiresAt:iso(NOW-1)}),Invalid);assert.throws(()=>check(payload(),{c:{...c,previousTime:NOW+1}}),Invalid);const expired={...payload(),expiresAt:iso(NOW-1),gracePeriodDays:1};assert.throws(()=>check(expired),Invalid);assert.equal(check(expired,{policy:{...policy,maxGraceDays:1}}).graceActive,true);});
+test('tier, catalogue and approved entitlement restrictions',()=>{for(const p of [{...payload(),tier:{code:'enterprise',name:'Enterprise'}},{...payload(),modules:['unknown']},{...payload(),modules:['sales_automation']},{...payload(),features:['advanced_reporting']},{...payload(),modules:['contact_management','contact_management']}])assert.throws(()=>check(p),Invalid);const x=check();assert.equal(allowsCapability(x,'module','contact_management'),true);assert.equal(allowsCapability(x,'feature','advanced_reporting'),false);});
+test('quota bounds, missing, invalid, null explicitly approved',()=>{for(const v of [-1,true,11,null])assert.throws(()=>check({...payload(),limits:{...limits,users:v}}),Invalid);const x=check();assert.equal(allowsQuota(x,'users',9),true);assert.equal(allowsQuota(x,'users',10),false);const y=check({...payload(),limits:{...limits,users:null}},{policy:{...policy,unlimitedQuotas:['users'],maxLimits:{...limits,users:null}}});assert.equal(allowsQuota(y,'users',100000),true);});
+test('required snapshot, valid snapshot, suspended and revoked licence',()=>{const required={...policy,requireSnapshot:true};assert.throws(()=>check(payload(),{policy:required}),Invalid);assert.equal(check(payload(),{policy:required,snapshot:exportSigned(snap())}).licenseId,'TEST-L');for(const status of ['suspended','revoked'])assert.throws(()=>check(payload(),{snapshot:exportSigned(snap({entries:[{licenseId:'TEST-L',status,changedAt:iso(NOW-600)}]}))}),Invalid);});
+test('snapshot binding, expiry, signature and revoked key',()=>{for(const s of [snap({deploymentId:'OTHER'}),snap({expiresAt:iso(NOW-1)}),snap({revokedKeyVersions:['v1']})])assert.throws(()=>check(payload(),{snapshot:exportSigned(s)}),Invalid);assert.throws(()=>check(payload(),{snapshot:exportSigned(snap(),second)}),Invalid);});
+test('snapshot rollback, equivocation and permanent revocation removal',()=>{const first=exportSigned(snap({revokedKeyVersions:['v2'],entries:[{licenseId:'OTHER-L',status:'revoked',changedAt:iso(NOW-600)}]}));const prior=verifySnapshot(first,keys,c,null);assert.equal(verifySnapshot(first,keys,c,prior).digest,prior.digest);for(const s of [snap({generatedAt:iso(NOW-700)}),snap({snapshotId:'changed'}),snap({generatedAt:iso(NOW-100)})])assert.throws(()=>verifySnapshot(exportSigned(s),keys,c,prior),Invalid);});
+test('no production or prototype envelope accepted by fallback',()=>{assert.throws(()=>check(payload(),{raw:Buffer.from(JSON.stringify({payload:{schema_version:1,product:'CEPHAS_CRM'},signature:'x'}))}),Invalid);assert.throws(()=>check(payload(),{c:{...c,environment:'production'}}),Invalid);});
