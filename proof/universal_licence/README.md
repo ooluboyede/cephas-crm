@@ -4,3 +4,5 @@ Run node --test proof/universal_licence/validator.test.mjs. No dependencies or n
 Gate 0.1.10.3 adds a test-only persistent common-contract entitlement store and eight Node tests. Run node --test proof/universal_licence/*.test.mjs. Native node:sqlite requires supported Node 22+ (experimental API); no third-party package. See docs/security/GATE_0_1_10_3_PERSISTENT_UNIVERSAL_STATE.md for explicit limitations.
 
 Gate 0.1.10.4 adds conservative renewal with preserved usage/history and six new tests, including two worker-thread contention cases. Existing test databases are disposable; no migration provided. See docs/security/GATE_0_1_10_4_RENEWAL_GOVERNANCE.md.
+
+Gate 0.1.14.2 adds a test-only Python-to-Node backend read entitlement bridge; mandatory snapshot and fixed operation mapping; charges attempts before reads and revalidates before returning buffered results. See docs/security/GATE_0_1_14_2_BACKEND_ENTITLEMENT_BOUNDARY.md. No real issuer certification.

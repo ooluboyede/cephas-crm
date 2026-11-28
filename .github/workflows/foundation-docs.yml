@@ -79,6 +79,7 @@ jobs:
             "docs/security/GATE_0_1_13_3_DURABLE_RECEIPT_RECOVERY.md"
             "docs/security/GATE_0_1_14_IDENTITY_AND_LICENSING_BOUNDARY.md"
             "docs/security/GATE_0_1_14_1_CALLBACK_SESSION_REMEDIATION.md"
+            "docs/security/GATE_0_1_14_2_BACKEND_ENTITLEMENT_BOUNDARY.md"
           )
           for file in "${required_files[@]}"; do
             git ls-files --error-unmatch -- "$file" >/dev/null
@@ -121,7 +122,11 @@ jobs:
         with:
           persist-credentials: false
       - name: Compile proof harness
-        run: python3 -m py_compile proof/tenant_boundary/run.py proof/tenant_boundary/broker.py proof/tenant_boundary/recovery_state.py proof/tenant_boundary/actor_broker.py proof/tenant_boundary/independent_authority.py proof/tenant_boundary/authority_receipt.py proof/tenant_boundary/receipt_floor.py proof/tenant_boundary/oidc_boundary.py proof/tenant_boundary/oidc_fixture.py
+        run: python3 -m py_compile proof/tenant_boundary/run.py proof/tenant_boundary/broker.py proof/tenant_boundary/recovery_state.py proof/tenant_boundary/actor_broker.py proof/tenant_boundary/independent_authority.py proof/tenant_boundary/authority_receipt.py proof/tenant_boundary/receipt_floor.py proof/tenant_boundary/oidc_boundary.py proof/tenant_boundary/oidc_fixture.py proof/tenant_boundary/licence_bridge.py
+      - name: Validate bridge syntax
+        run: |
+          node --check proof/universal_licence/read_bridge.mjs
+          node --check proof/universal_licence/read_fixture.mjs
       - name: Run real PostgreSQL proof
         env:
           PROOF_PR_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}

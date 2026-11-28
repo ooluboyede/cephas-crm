@@ -15,6 +15,7 @@ from broker import Broker, Denied
 from actor_broker import ActorBroker
 from oidc_boundary import OIDCVerifier, SessionGate
 from oidc_fixture import TestIdP
+from licence_bridge import ReadEntitlement
 from independent_authority import R2Proof, AuthorityDenied
 from recovery_state import RecoveryState, initialize, advance, read_state
 
@@ -613,7 +614,7 @@ class Boundary(unittest.TestCase):
             with self.assertRaises(Exception):
                 verify_rotation(raw,r.signer.sign(raw),new,r.public,replacement.public,r.deployment,1,floor)
 
-    def oidc_fixture(self):
+    def oidc_fixture(self,entitlement=None):
         r=self.r2_fixture()
         now=[1800000000]
         idp=TestIdP(r.local.parent,"key1")
@@ -623,7 +624,7 @@ class Boundary(unittest.TestCase):
         principals={(issuer,"subject-alice"):"alice",(issuer,"subject-charlie"):"charlie",
                     (issuer,"subject-bob"):"bob"}
         tokens={a:secrets.token_hex(32) for a in ("alice","charlie","bob")}
-        gate=SessionGate(verifier,principals,tokens,r,Session,exchange=idp.exchange)
+        gate=SessionGate(verifier,principals,tokens,r,Session,exchange=idp.exchange,entitlement=entitlement)
         def claims(expected_nonce,**changes):
             value={"iss":issuer,"aud":"cephas-crm-proof","sub":"subject-alice",
                    "nonce":expected_nonce,"iat":now[0],"exp":now[0]+120,"auth_time":now[0],
@@ -779,6 +780,81 @@ class Boundary(unittest.TestCase):
         now[0]+=3
         with self.assertRaises(Denied):
             gate.execute(session,"A","1","list_items")
+
+    def licensed_fixture(self,profile="full"):
+        directory=tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        path=Path(directory.name)
+        helper=ROOT.parent/"universal_licence"/"read_fixture.mjs"
+        subprocess.run(["node",str(helper),"init",str(path),"1800000000000",profile],
+                       check=True,capture_output=True,timeout=15)
+        r,now,idp,verifier,gate,claims=self.oidc_fixture(ReadEntitlement(path))
+        def login(subject="subject-alice"):
+            state,nonce=gate.begin()
+            return gate.complete(state,idp.token(claims(nonce,sub=subject)))
+        def revoke():
+            subprocess.run(["node",str(helper),"revoke",str(path),str(now[0]*1000)],
+                           check=True,capture_output=True,timeout=15)
+        return r,now,gate,login,revoke,path
+
+    def test_f04_signed_entitlements_gate_authenticated_reads_and_quota(self):
+        r,now,gate,login,revoke,path=self.licensed_fixture()
+        session=login()
+        self.assertEqual(gate.execute(session,"A","1","list_items"),["A1"])
+        self.assertEqual(gate.execute(session,"A","1","list_notes"),["note-A1"])
+        with self.assertRaises(Denied):
+            gate.execute(session,"A","1","list_items")
+        db=sqlite3.connect(path/"state.sqlite")
+        try:
+            self.assertEqual(db.execute("SELECT count(*) FROM effects WHERE quota='apiCalls'").fetchone(),(2,))
+        finally:
+            db.close()
+
+    def test_f04_missing_module_feature_and_zero_quota_deny_reads(self):
+        for profile,operation in (("no_notes","list_notes"),("no_api","list_items"),("zero","list_items")):
+            r,now,gate,login,revoke,path=self.licensed_fixture(profile)
+            with self.assertRaises(Denied):
+                gate.execute(login(),"A","1",operation)
+            db=sqlite3.connect(path/"state.sqlite")
+            try:
+                self.assertEqual(db.execute("SELECT count(*) FROM effects").fetchone(),(0,))
+            finally:
+                db.close()
+
+    def test_f04_licensed_deployment_scope_not_inferred_from_identity(self):
+        r,now,gate,login,revoke,path=self.licensed_fixture()
+        # Bob is authorized by the underlying broker, but belongs to a
+        # different synthetic customer not entitled by this installation.
+        with self.assertRaises(Denied):
+            gate.execute(login("subject-bob"),"B","1","list_items")
+        self.assertEqual(gate.execute(login(),"A","1","list_items"),["A1"])
+
+    def test_f04_revocation_and_missing_state_deny_existing_sessions(self):
+        r,now,gate,login,revoke,path=self.licensed_fixture()
+        session=login()
+        self.assertEqual(gate.execute(session,"A","1","list_items"),["A1"])
+        revoke()
+        with self.assertRaises(Denied):
+            gate.execute(session,"A","1","list_items")
+        (path/"state.sqlite").unlink()
+        with self.assertRaises(Denied):
+            gate.execute(session,"A","1","list_items")
+
+    def test_f04_revocation_during_read_suppresses_buffered_result(self):
+        r,now,gate,login,revoke,path=self.licensed_fixture()
+        original=r.fenced_read
+        def revoked(*args):
+            rows=original(*args)
+            revoke()
+            return rows
+        r.fenced_read=revoked
+        with self.assertRaises(Denied):
+            gate.execute(login(),"A","1","list_items")
+        db=sqlite3.connect(path/"state.sqlite")
+        try:
+            self.assertEqual(db.execute("SELECT count(*) FROM effects").fetchone(),(1,))
+        finally:
+            db.close()
 
     def recovery_fixture(self):
         directory = tempfile.TemporaryDirectory()
@@ -1384,7 +1460,7 @@ def main():
         print("Server:", with_version.stdout.strip(), "merge SHA:", os.environ.get("GITHUB_SHA", "local"),
               "PR head:", os.environ.get("PROOF_PR_HEAD", "local"), flush=True)
         result = unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromTestCase(Boundary))
-        if not result.wasSuccessful() or result.skipped or result.testsRun != 80:
+        if not result.wasSuccessful() or result.skipped or result.testsRun != 85:
             raise SystemExit(1)
     finally:
         for container in (NAME, AUTHORITY_NAME):

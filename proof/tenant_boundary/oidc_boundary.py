@@ -166,7 +166,7 @@ class OIDCVerifier:
 
 class SessionGate:
     """Trusted in-process session adapter with fixed principal/operation mapping."""
-    def __init__(self,verifier,principals,credentials,authority,factory,exchange=None):
+    def __init__(self,verifier,principals,credentials,authority,factory,exchange=None,entitlement=None):
         self._verifier=verifier
         self._principals=MappingProxyType(dict(principals))
         self._credentials=MappingProxyType(dict(credentials))
@@ -176,6 +176,7 @@ class SessionGate:
         self._code_pending={}
         self._sessions={}
         self._exchange=exchange
+        self._entitlement=entitlement
         self._redirect='https://crm.example.invalid/oidc/callback'
         self._lock=threading.RLock()
 
@@ -272,10 +273,15 @@ class SessionGate:
                 # client claims of role/membership. Database checks live membership.
                 if operation=="list_notes":
                     need(acr=="urn:cephas:proof:mfa")
+                reservation=None
+                if self._entitlement is not None:
+                    reservation=self._entitlement.reserve(actor,tenant,bu,operation,now)
                 rows=self._authority.fenced_read(self._credentials,self._factory,
                     self._credentials[actor],tenant,bu,operation)
                 finished=self._verifier.now()
                 need(finished<deadline and finished<now+30)
+                if reservation is not None:
+                    self._entitlement.confirm(reservation,finished)
                 self._sessions[session]=(token,nonce,principal,deadline,finished)
                 return rows
         except Exception:

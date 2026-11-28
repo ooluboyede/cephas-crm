@@ -10,6 +10,8 @@ const OPERATIONS = Object.freeze({
   activate_user: ['module','contact_management','users'],
   add_site: ['feature','multi_site','sites'],
   add_unit: ['module','account_management','businessUnits'],
+  read_items: ['module','contact_management','apiCalls','api_access'],
+  read_notes: ['module','customer_service','apiCalls','api_access'],
 });
 function demand(ok){if(!ok)throw new Invalid('offline entitlement denied');}
 function hash(s){return createHash('sha256').update(s).digest('hex');}
@@ -121,9 +123,9 @@ export class EntitlementStore {
       try{
         demand(typeof action==='string'&&Object.hasOwn(OPERATIONS,action));
         identifier(requestId);identifier(target);
-        const [kind,code,quota]=OPERATIONS[action];q=quota;
+        const [kind,code,quota,feature]=OPERATIONS[action];q=quota;
         const licence=verifyLicence(Buffer.from(row.licence),this.#config.keys,c,this.#config.policy,raw,prior);
-        demand(licence.licenseId===row.licence_id&&licence.issuedAt===row.issued&&licence.expiresAt===row.expiry&&allowsCapability(licence,kind,code));
+        demand(licence.licenseId===row.licence_id&&licence.issuedAt===row.issued&&licence.expiresAt===row.expiry&&allowsCapability(licence,kind,code)&&(!feature||allowsCapability(licence,'feature',feature)));
         const existing=db.prepare('SELECT action,target FROM effects WHERE request_id=?').get(requestId);
         if(existing){demand(existing.action===action&&existing.target===target);return 'duplicate';}
         demand(!db.prepare('SELECT request_id FROM effects WHERE action=? AND target=?').get(action,target));
