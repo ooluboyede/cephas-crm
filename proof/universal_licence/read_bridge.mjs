@@ -9,7 +9,7 @@ try{
   const dir=process.argv[2], configPath=join(dir,'config.json');
   need(lstatSync(configPath).isFile());
   const cfg=JSON.parse(readFileSync(configPath,'utf8'));
-  need(cfg.binding.environment==='test'&&cfg.policy.requireSnapshot===true);
+  need(cfg.issuerProfile==='current-v1'&&cfg.binding.environment==='staging'&&cfg.policy.requireSnapshot===true);
   const config={...cfg,keys:new Map(cfg.keys)};
   const bytes=readFileSync(0);
   need(bytes.length>0&&bytes.length<=1024);

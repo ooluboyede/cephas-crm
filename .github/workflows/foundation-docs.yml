@@ -80,6 +80,7 @@ jobs:
             "docs/security/GATE_0_1_14_IDENTITY_AND_LICENSING_BOUNDARY.md"
             "docs/security/GATE_0_1_14_1_CALLBACK_SESSION_REMEDIATION.md"
             "docs/security/GATE_0_1_14_2_BACKEND_ENTITLEMENT_BOUNDARY.md"
+            "docs/licensing/GATE_0_1_14_3_ISSUER_CERTIFICATION_PREFLIGHT.md"
           )
           for file in "${required_files[@]}"; do
             git ls-files --error-unmatch -- "$file" >/dev/null
@@ -140,4 +141,4 @@ jobs:
       - name: Run universal issuer compatibility proof
         run: |
           node --version
-          node --test proof/universal_licence/validator.test.mjs proof/universal_licence/state.test.mjs
+          node --test proof/universal_licence/validator.test.mjs proof/universal_licence/state.test.mjs proof/universal_licence/current_issuer.test.mjs

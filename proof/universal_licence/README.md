@@ -6,3 +6,5 @@ Gate 0.1.10.3 adds a test-only persistent common-contract entitlement store and 
 Gate 0.1.10.4 adds conservative renewal with preserved usage/history and six new tests, including two worker-thread contention cases. Existing test databases are disposable; no migration provided. See docs/security/GATE_0_1_10_4_RENEWAL_GOVERNANCE.md.
 
 Gate 0.1.14.2 adds a test-only Python-to-Node backend read entitlement bridge; mandatory snapshot and fixed operation mapping; charges attempts before reads and revalidates before returning buffered results. See docs/security/GATE_0_1_14_2_BACKEND_ENTITLEMENT_BOUNDARY.md. No real issuer certification.
+
+Gate 0.1.14.3 adds current-v1 stricter issuer profile to the staging licensed read fixture and eight Node regression tests. See docs/licensing/GATE_0_1_14_3_ISSUER_CERTIFICATION_PREFLIGHT.md; no genuine issuer certification or atomic production mutation claim.

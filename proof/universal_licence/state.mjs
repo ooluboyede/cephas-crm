@@ -3,6 +3,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { closeSync, openSync, lstatSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { Invalid, verifyLicence, verifySnapshot, allowsQuota, allowsCapability } from './validator.mjs';
+import { verifyCurrentLicence, verifyCurrentSnapshot } from './current_issuer.mjs';
 
 const OPERATIONS = Object.freeze({
   create_contact: ['module','contact_management','transactions'],
@@ -18,12 +19,15 @@ function hash(s){return createHash('sha256').update(s).digest('hex');}
 function identifier(s){demand(typeof s==='string'&&/^[A-Za-z0-9_-]{1,64}$/.test(s));return s;}
 function normalized(config){
   const c=structuredClone(config);
-  demand(c&&c.binding&&c.binding.productCode==='CEPHAS_CRM'&&c.binding.environment==='test');
+  demand(c&&c.binding&&c.binding.productCode==='CEPHAS_CRM');
+  demand(c.issuerProfile==='current-v1'?c.binding.environment==='staging':c.issuerProfile===undefined&&c.binding.environment==='test');
   for(const k of ['customerCode','deploymentId','environment'])identifier(c.binding[k]);
   demand(c.keys instanceof Map&&c.keys.size>0&&c.policy);
   return c;
 }
-function configHash(c){return hash(JSON.stringify({binding:c.binding,keys:[...c.keys],policy:c.policy}));}
+function configHash(c){return hash(JSON.stringify({binding:c.binding,keys:[...c.keys],policy:c.policy,issuerProfile:c.issuerProfile}));}
+function licenceFor(c,raw,context,snapshot,prior=null){return (c.issuerProfile==='current-v1'?verifyCurrentLicence:verifyLicence)(raw,c.keys,context,c.policy,snapshot,prior);}
+function snapshotFor(c,raw,context,prior){return (c.issuerProfile==='current-v1'?verifyCurrentSnapshot:verifySnapshot)(raw,c.keys,context,prior);}
 function connect(path){
   demand(lstatSync(path).isFile());
   const db=new DatabaseSync(path);
@@ -49,8 +53,8 @@ export class EntitlementStore {
   static initialize(path,config,clock,raw,snapshot=null){
     const store=new EntitlementStore(path,config,clock);
     const c=store.#context(0);
-    const licence=verifyLicence(raw,store.#config.keys,c,store.#config.policy,snapshot);
-    const accepted=snapshot===null?null:verifySnapshot(snapshot,store.#config.keys,c,null);
+    const licence=licenceFor(store.#config,raw,c,snapshot);
+    const accepted=snapshot===null?null:snapshotFor(store.#config,snapshot,c,null);
     // Explicit operator bootstrap only. Never auto-create a missing store.
     closeSync(openSync(path,'wx',0o600));
     transaction(path,db=>{
@@ -77,7 +81,7 @@ export class EntitlementStore {
     if(row.snapshot!==null){
       demand(Number.isSafeInteger(row.imported)&&row.imported<=row.observed&&row.imported>=0);
       raw=Buffer.from(row.snapshot);
-      prior=verifySnapshot(raw,this.#config.keys,{...this.#config.binding,now:row.imported,previousTime:0},null);
+      prior=snapshotFor(this.#config,raw,{...this.#config.binding,now:row.imported,previousTime:0},null);
       demand(prior.digest===row.snapshot_digest);
     }else demand(row.snapshot_digest===null&&row.imported===null);
     return {row,prior,raw};
@@ -87,7 +91,7 @@ export class EntitlementStore {
     // allow a valid newer revocation snapshot to become durable.
     return transaction(this.#path,db=>{
       const {row,prior}=this.#load(db),c=this.#context(row.observed);
-      const next=verifySnapshot(snapshot,this.#config.keys,c,prior);
+      const next=snapshotFor(this.#config,snapshot,c,prior);
       db.prepare('UPDATE authority SET snapshot=?,snapshot_digest=?,imported=?,observed=? WHERE id=1')
         .run(snapshot,next.digest,c.now,c.now);
       return next.digest;
@@ -98,7 +102,7 @@ export class EntitlementStore {
   renew(raw){
     return transaction(this.#path,db=>{
       const {row,prior,raw:snapshot}=this.#load(db),c=this.#context(row.observed);
-      const next=verifyLicence(raw,this.#config.keys,c,this.#config.policy,snapshot,prior);
+      const next=licenceFor(this.#config,raw,c,snapshot,prior);
       const digest=hash(raw);
       if(digest===row.licence_digest)return 'duplicate';
       demand(!db.prepare('SELECT digest FROM licence_history WHERE digest=?').get(digest));
@@ -124,7 +128,7 @@ export class EntitlementStore {
         demand(typeof action==='string'&&Object.hasOwn(OPERATIONS,action));
         identifier(requestId);identifier(target);
         const [kind,code,quota,feature]=OPERATIONS[action];q=quota;
-        const licence=verifyLicence(Buffer.from(row.licence),this.#config.keys,c,this.#config.policy,raw,prior);
+        const licence=licenceFor(this.#config,Buffer.from(row.licence),c,raw,prior);
         demand(licence.licenseId===row.licence_id&&licence.issuedAt===row.issued&&licence.expiresAt===row.expiry&&allowsCapability(licence,kind,code)&&(!feature||allowsCapability(licence,'feature',feature)));
         const existing=db.prepare('SELECT action,target FROM effects WHERE request_id=?').get(requestId);
         if(existing){demand(existing.action===action&&existing.target===target);return 'duplicate';}
